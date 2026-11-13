@@ -1,0 +1,15 @@
+# CUDA GPU install (recommended):
+#   Windows:  install_cuda.bat
+#   Linux:    bash install_cuda.sh
+# Or: pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Then install the rest of this file. A CPU wheel also works for smoke tests.
+torch
+numpy
+omegaconf
+hydra-core
+transformers>=4.51
+huggingface_hub
+regex
+tqdm
+# optional: HuggingFace datasets, used only with --hf_dataset
+# datasets

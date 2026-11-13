@@ -1,0 +1,191 @@
+# GPT-1 scale Next-Concept Model (not a clone of 2018 GPT-1 weights).
+# Transformer body matches GPT-1 (12 layers, d=768, 12 heads, d_ff=3072, context 512)
+# but training is two-stage NCM: residual VQ-VAE tokenizer + coarse-to-fine generator.
+#
+# Paper / official OWT-style tokenizer (Table 5) scaled to L=512, codebook 4096 at
+# every level. Generator flags follow official TinyStories / OWT eval configs.
+name: gpt1
+seed: 42
+
+tokenizer:
+  pre_tokenizer:
+    name: hf
+    tokenizer: hf
+    model_id: gpt2
+    special_tokens:
+      eos_token: "<|endoftext|>"
+      pad_token: "<|pad|>"
+  vqvae:
+    n_layers: 6          # attention head count in Encoder/Decoder, not depth
+    embed_dim: 384
+    in_vocab_size: 50304  # official OWT padding of gpt2 (+ pad) up to a multiple of 64
+    context_length: 512
+    compression_factor: 1
+    dropout: 0.3
+    pre_quant_groupnorm: 8
+    use_qk_norm: true
+    pre_quant_dropout: 0.0
+    enc_layers: 0
+    dec_layers: 1
+    # 23 levels, codebook 4096 each (paper OWT Table 5, ending at L=512)
+    vqvae_vocab_size:
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+      - 4096
+    vector_quantizer_config:
+      clss: multiscale_residual_vector_quantizer
+      decay: 0.99
+      epsilon: 1.0e-05
+      commitment_cost: 0.25
+      learned_l1_sampling: true
+      learned_l1_cascade: true
+      learned_l1_cascade_base: 4
+      learned_all_sampling: false
+      quant_resi:
+        enabled: true
+        ratio: 0.5
+        share_mode: 0
+        learnable_ratio: false
+      aux:
+        fine_drop:
+          # Official implementation of nested dropout
+          prob: 0.5
+          min_keep: 1
+        # Skip adding a residual where energy is already tiny (tokenizer training).
+        spatial_skip:
+          enabled: true
+          min_level: 8
+          energy_ratio: 0.2
+          random_prob: 0.05
+      levels:
+        use_manual_levels: true
+        # Perfect squares ending at 512 (23 levels)
+        manual_levels: [1, 4, 9, 16, 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225, 256, 289, 324, 361, 400, 441, 484, 512]
+      learned_l1_cascade_norm: false
+      learned_l1_cascade_norm_final: false
+      ema_scale_by_world_size: false
+
+model:
+  n_layer: 12
+  n_head: 12
+  n_embd: 768
+  bias: true
+  dropout: 0.1
+  context_length: 513     # prefix 1 + L, official pattern
+  prefix_len: 1
+  raw_token_prefix: true
+  # gpt2 vocab is 50257 (ids 0-50256); adding <|pad|> yields 50257.
+  # train_generator.py / generate.py overwrite this from the real tokenizer
+  # if add_special_tokens ever shifts it.
+  prefix_pad_token_id: 50257
+  # 22 heads (K-1). query_level0=false, predict_level0=false: level 0 is NOT
+  # predicted by the transformer; it is sampled from a training unigram.
+  vocab_size:
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+    - 4096
+  predict_level0: false
+  query_level0: false
+  attn_pattern: block_diagonal
+  use_positional_encoding: true
+  use_level_encoding: true
+  use_rope: true
+  rope_base: 100000
+  use_qk_norm: true
+  ctx_encoder:
+    enabled: false
+    n_layer: 4
+    vocab_size: 50304
+  use_flex_attention: true
+  post_upsample_conv:
+    enabled: false
+  # TinyStories: tied codebook heads with a learned temperature scale; bias off.
+  tie_heads_to_codebook: true
+  tie_heads_learn_scale: true
+
+train:
+  tokenizer:
+    # Default 16 is tuned for a 16 GiB GPU (e.g. RTX 4070 Ti SUPER) with bf16.
+    # If you OOM, pass --batch_size 8. The paper used much larger global batches.
+    batch_size: 16
+    peak_lr: 3.0e-4
+    floor_lr: 3.0e-5
+    warmup: 1000
+    betas: [0.9, 0.95]
+    weight_decay: 0.01
+    grad_clip: 1.0
+    max_steps: 100000
+    save_every: 2000
+    pack_repeat: 1
+  generator:
+    batch_size: 16
+    peak_lr: 3.0e-4
+    floor_lr: 3.0e-5
+    warmup: 500
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+    grad_clip: 1.0
+    max_steps: 100000
+    save_every: 2000
+    alpha: 0.0            # every code position equal (matches ELBO)
+    corrupt_p_max: 0.8    # linearly decreasing corruption, mean rate 0.50
+    corrupt_p_min: 0.2
+    pack_repeat: 1
+
+generation:
+  temperature: 1.0
+  top_k: 0
+  top_p: 1.0
+  level0_unigram: generator.pt:inference.level0_unigram
+  # Expand a later level only where the current decode is still uncertain.
+  # Conservative defaults: always run the first 16 levels, always refine the
+  # most uncertain 25% of cells, and never skip a cell that is not already sharp.
+  adaptive:
+    enabled: true
+    early_stop: true
+    spatial: true
+    min_levels: 16
+    spatial_after: 8
+    token_conf_threshold: 0.92
+    token_stable_threshold: 0.98
+    spatial_conf_threshold: 0.97
+    min_expand_frac: 0.25
