@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from utils.linguistic import pack_kwargs_from_cfg
 from utils.data import (
     infinite_loader,
     iter_documents_from_file,
@@ -119,9 +120,12 @@ def main():
 
     docs = collect_documents(args)
     L = int(cfg.tokenizer.vqvae.context_length)
+    pack_kw = pack_kwargs_from_cfg(cfg)
     windows, n_docs, n_toks = pack_documents(
-        docs, pre_tok, L, min_windows=batch_size, repeat=pack_repeat
+        docs, pre_tok, L, min_windows=batch_size, repeat=pack_repeat, **pack_kw
     )
+    if pack_kw.get("respect_sentences"):
+        print("packing windows at sentence boundaries")
     print(f"packed {n_docs} docs / {n_toks} tokens -> {len(windows)} windows of L={L}")
     loader = make_loader(
         windows, batch_size=batch_size, seed=seed, pin_memory=pin, num_workers=args.workers

@@ -67,39 +67,97 @@ def iter_documents_from_hf(name, split="train", text_field="text", config_name=N
             yield text
 
 
-def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repeat=1):
-    """Encode documents, append EOS, concatenate, and pack/pad to length L."""
+def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repeat=1, respect_sentences=False):
+    """Encode documents, append EOS, and pack/pad to length L.
+
+    When respect_sentences is True, a new window starts at a sentence boundary
+    whenever the next sentence would overflow the current window. A sentence
+    longer than L is packed by tokens as usual.
+    """
     eos = int(pre_tokenizer.eos_token_id)
     pad = int(pre_tokenizer.pad_token_id)
     L = int(context_length)
-    stream = []
     n_docs = 0
-    for _ in range(max(int(repeat), 1)):
-        for text in documents:
-            ids = pre_tokenizer.encode(text)
-            if not ids:
-                continue
-            stream.extend(ids)
-            stream.append(eos)
-            n_docs += 1
-    if not stream:
-        raise ValueError("no tokens produced from the given documents")
-
+    n_toks = 0
     windows = []
-    for i in range(0, len(stream), L):
-        chunk = stream[i : i + L]
-        if len(chunk) < L:
+
+    def flush(cur):
+        if not cur:
+            return []
+        if len(cur) < L:
+            return cur + [pad] * (L - len(cur))
+        return cur[:L]
+
+    if respect_sentences:
+        from utils.linguistic import split_sentences
+        cur = []
+        for _ in range(max(int(repeat), 1)):
+            for text in documents:
+                sentences = split_sentences(text) or ([text] if str(text).strip() else [])
+                wrote = False
+                for sent in sentences:
+                    ids = list(pre_tokenizer.encode(sent) or [])
+                    if not ids:
+                        continue
+                    wrote = True
+                    n_toks += len(ids)
+                    if len(ids) > L:
+                        if cur:
+                            windows.append(flush(cur))
+                            cur = []
+                        for i in range(0, len(ids), L):
+                            chunk = ids[i:i + L]
+                            if len(chunk) == L:
+                                windows.append(chunk)
+                            else:
+                                cur = list(chunk)
+                        continue
+                    if cur and len(cur) + len(ids) > L:
+                        windows.append(flush(cur))
+                        cur = []
+                    cur.extend(ids)
+                if wrote:
+                    n_docs += 1
+                    if len(cur) >= L:
+                        windows.append(cur[:L])
+                        cur = cur[L:]
+                    if len(cur) + 1 <= L:
+                        cur.append(eos)
+                        n_toks += 1
+                    else:
+                        windows.append(flush(cur))
+                        cur = [eos]
+                        n_toks += 1
+        if cur:
+            windows.append(flush(cur))
+        if not windows:
+            raise ValueError("no tokens produced from the given documents")
+    else:
+        stream = []
+        for _ in range(max(int(repeat), 1)):
+            for text in documents:
+                ids = pre_tokenizer.encode(text)
+                if not ids:
+                    continue
+                stream.extend(ids)
+                stream.append(eos)
+                n_docs += 1
+        if not stream:
+            raise ValueError("no tokens produced from the given documents")
+        n_toks = len(stream)
+        for i in range(0, len(stream), L):
+            chunk = stream[i:i + L]
             if not chunk:
                 continue
-            chunk = chunk + [pad] * (L - len(chunk))
-        windows.append(chunk)
+            if len(chunk) < L:
+                chunk = chunk + [pad] * (L - len(chunk))
+            windows.append(chunk)
 
-    # Repeat packed windows so a small corpus still fills a requested batch.
     if min_windows and len(windows) < min_windows:
         reps = (min_windows + len(windows) - 1) // len(windows)
         windows = windows * reps
     data = torch.tensor(windows, dtype=torch.long)
-    return data, n_docs, len(stream)
+    return data, n_docs, n_toks
 
 
 def default_workers(user_value=None, pin_memory=False):

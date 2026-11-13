@@ -718,11 +718,27 @@ class NextConceptTransformer(Transformer):
                     idx_next = torch.where(done_mask.view(-1, 1), hold, idx_next)
 
                 if use_adaptive and ad["spatial"] and next_level >= int(ad["spatial_after"]):
-                    conf_now, _tok_now = decode_confidence(self.vqvae_local[0], z_hat)
-                    cell_conf = pool_to_cells(conf_now, int(L_cur))
-                    expand = spatial_expand_mask(
-                        cell_conf, ad["spatial_conf_threshold"], ad["min_expand_frac"]
-                    )
+                    conf_now, tok_now = decode_confidence(self.vqvae_local[0], z_hat)
+                    tok = ad.get("tokenizer")
+                    if ad.get("guide_expand") and tok is not None:
+                        from utils.linguistic import expand_mask_from_units
+                        expand, units_used = expand_mask_from_units(
+                            conf_now,
+                            tok_now,
+                            tok,
+                            int(L_cur),
+                            ad.get("unit", "auto"),
+                            ad["spatial_conf_threshold"],
+                            ad["min_expand_frac"],
+                            eos_id=ad.get("eos_id"),
+                            pad_id=ad.get("pad_id"),
+                        )
+                        expand_info.setdefault("units", []).append(units_used[0] if units_used else ad.get("unit", "auto"))
+                    else:
+                        cell_conf = pool_to_cells(conf_now, int(L_cur))
+                        expand = spatial_expand_mask(
+                            cell_conf, ad["spatial_conf_threshold"], ad["min_expand_frac"]
+                        )
                     if done_mask is not None:
                         expand = expand & ~done_mask.view(-1, 1)
                     skipped_before = idx_next

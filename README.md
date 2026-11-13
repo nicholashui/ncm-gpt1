@@ -101,6 +101,7 @@ python generate.py --config config/gpt1.yaml --n 4 --temperature 1.0 --show_leve
 - 有 CUDA 時預設開混合精度，不必再加 `--amp`。`--no-amp` 可改回 fp32；`--device cpu` 可強制用 CPU。
 - 有 CUDA 時預設嘗試 `torch.compile`（失敗會自動退回一般模式）。`--no-compile` 可關閉。
 - GPT-1 設定已開啟 Flex Attention（`use_flex_attention: true`），用區塊稀疏核跑區塊對角遮罩。若啟動失敗，把該項改回 `false` 即可退回一般 SDPA。
+- 生成前會先用「句 → 片語 → 詞」切開（`splitter`，預設規則切分）。訓練時視窗會盡量在句界開始；生成展開時，粗層對應句子、中層對應片語、細層對應詞，只細化仍不確定的單位。可用 `python scripts/diagnose_split.py --file data/smoke_corpus.txt` 查看切分樹。若要改用小型神經切分器，跑 `python train_splitter.py --config config/gpt1.yaml`，再把 `splitter.backend` 設成 `model`。
 - 預設「只在需要時才展開」：生成時若目前解碼已經夠確定且穩定，就提前停掉後面的層；同一層裡高把握的片段（類似圖像的黑背景）不再細化，改加接近 0 的殘差。可用 `--no-adaptive` 關閉。tokenizer 訓練也會依殘差能量跳過過弱的 cell。可用 `python scripts/diagnose_expand.py --tokenizer_ckpt ...` 查看每一層的殘差與把握度。
 
 無條件前綴是一顆 GPT-2 EOS（shape `(B, 1)`）。`generate.py --show_levels` 會把每一層的中間重建印出來，方便看由粗到細的過程。

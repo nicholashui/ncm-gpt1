@@ -106,3 +106,10 @@ generation:
   top_p: 1.0
   adaptive:
     enabled: false
+
+splitter:
+  enabled: true
+  backend: rules
+  pack_by_sentence: false
+  guide_expand: false
+  unit: auto

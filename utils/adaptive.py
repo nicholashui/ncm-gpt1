@@ -27,6 +27,11 @@ def default_adaptive_cfg(raw: Any = None) -> dict:
         "token_stable_threshold": float(src.get("token_stable_threshold", 0.98)),
         "spatial_conf_threshold": float(src.get("spatial_conf_threshold", 0.97)),
         "min_expand_frac": float(src.get("min_expand_frac", 0.25)),
+        "guide_expand": bool(src.get("guide_expand", True)),
+        "unit": str(src.get("unit", "auto")),
+        "tokenizer": src.get("tokenizer"),
+        "eos_id": src.get("eos_id"),
+        "pad_id": src.get("pad_id"),
     }
 
 

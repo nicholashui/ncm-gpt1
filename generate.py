@@ -19,6 +19,7 @@ import torch
 from omegaconf import OmegaConf
 
 from utils.adaptive import default_adaptive_cfg
+from utils.linguistic import default_splitter_cfg, format_tree, split_text_tree
 from utils.train_utils import (
     add_device_args,
     configure_cuda,
@@ -46,6 +47,8 @@ def parse_args():
     p.add_argument("--show_levels", action="store_true", help="print intermediate level decodes")
     p.add_argument("--adaptive", dest="adaptive", action="store_true", default=None, help="expand a level only where still needed")
     p.add_argument("--no-adaptive", dest="adaptive", action="store_false", help="always expand every level and cell")
+    p.add_argument("--show_split", action="store_true", help="print sentence/phrase/word tree of each sample")
+    p.add_argument("--no-split", dest="show_split", action="store_false", help="do not print the split tree")
     add_device_args(p)
     p.add_argument("--cut_at_eos", action="store_true", default=True)
     p.add_argument("--no_cut_at_eos", action="store_false", dest="cut_at_eos")
@@ -112,6 +115,13 @@ def main():
         ad = default_adaptive_cfg(g.get("adaptive", {}))
         if args.adaptive is not None:
             ad["enabled"] = bool(args.adaptive)
+        sc = default_splitter_cfg(cfg.get("splitter", {}))
+        if sc["enabled"] and sc["guide_expand"]:
+            ad["guide_expand"] = True
+            ad["unit"] = sc["unit"]
+            ad["tokenizer"] = pre_tok
+            ad["eos_id"] = eos_id
+            ad["pad_id"] = int(pre_tok.pad_token_id)
         codes, info = net.generate(
             l0, prefix, temperature=temperature, top_k=top_k, top_p=top_p,
             adaptive=ad, return_info=True,
@@ -131,9 +141,11 @@ def main():
         skips = info.get("spatial_skip_frac", [])
         mean_stop = sum(stopped) / max(len(stopped), 1)
         mean_skip = sum(skips) / max(len(skips), 1) if skips else 0.0
+        units = info.get("units") or []
+        unit_note = f"  units={units[:6]}" if units else ""
         print(
             f"adaptive=on  stopped_after={stopped}  mean_stop={mean_stop:.1f}/{len(levels)}  "
-            f"spatial_skip_frac={mean_skip:.3f}"
+            f"spatial_skip_frac={mean_skip:.3f}{unit_note}"
         )
     else:
         print("adaptive=off  (every level and cell expanded)")
@@ -141,6 +153,11 @@ def main():
         text = detokenize(pre_tok, tokens[i].tolist(), eos_id, pad_id, cut_at_eos=args.cut_at_eos)
         print(f"\n===== sample {i} =====")
         print(text if text else "(empty after EOS/PAD cut)")
+        if args.show_split or (cfg.get("splitter", {}) or {}).get("enabled", False):
+            tree = split_text_tree(text or "")
+            if tree:
+                print("-- split --")
+                print(format_tree(tree))
         if args.show_levels:
             for k, z_k in enumerate(zl):
                 logits_k = vqvae.decoder(z_k)

@@ -189,3 +189,17 @@ generation:
     token_stable_threshold: 0.98
     spatial_conf_threshold: 0.97
     min_expand_frac: 0.25
+    # Guided by the linguistic splitter when splitter.enabled is true.
+    guide_expand: true
+    unit: auto
+
+# Split text first: sentence → phrase → word. Windows pack at sentence
+# boundaries. Generation expands a cell only if the overlapping unit is uncertain.
+# backend=rules works immediately; train_splitter.py can fit a tiny tagger, then set backend: model.
+splitter:
+  enabled: true
+  backend: rules
+  ckpt: artifacts/splitter/splitter.pt
+  pack_by_sentence: true
+  guide_expand: true
+  unit: auto
