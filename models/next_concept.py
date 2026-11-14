@@ -443,10 +443,15 @@ class NextConceptTransformer(Transformer):
                 prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
 
         rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
+        use_chunked = bool(getattr(self.config, "use_chunked_block_attn", True))
         if self.use_flex_attention:
             block_mask = self._get_flex_block_mask(x.device)
             for block in self.transformer.blocks:
                 x = block(x, rope_cos_sin=rope, block_mask=block_mask)
+        elif use_chunked:
+            layout = (self.prefix_len, tuple(int(l) for l in self.levels[self._lvl_first:]))
+            for block in self.transformer.blocks:
+                x = block(x, attn_mask=attn_mask, rope_cos_sin=rope, block_layout=layout)
         else:
             for block in self.transformer.blocks:
                 x = block(x, attn_mask=attn_mask, rope_cos_sin=rope)

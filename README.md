@@ -30,9 +30,9 @@
 | Generator | 2 層 × 32 維 × 4 頭 | 12 層 × 768 維 × 12 頭 |
 | 前綴 | 長度 1（EOS） | 長度 1（EOS），`raw_token_prefix=true` |
 | **Tokenizer 參數** | **58,576（0.06M）** | **92,276,480（92.28M）**；非嵌入 72.76M |
-| **Generator 參數** | **32,992（0.03M）** | **91,858,198（91.86M）**；非嵌入 91.55M |
+| **Generator 參數** | **32,992（0.03M）** | **101,688,854（101.69M）**；非嵌入 101.38M |
 
-Generator 少於原始 GPT-1 的約 1.17 億，是因為沒有 4 萬詞的 token 嵌入表（改為把 VQ 維度 384 投到 768，輸出頭與碼本綁定）。Tokenizer 是額外的模組，裡面含 23 本 4096×384 的碼本與兩張 50304×384 的表層嵌入。
+Generator 少於原始 GPT-1 的約 1.17 億，是因為沒有 4 萬詞的 token 嵌入表（改為把 VQ 維度 384 投到 768，輸出頭與碼本綁定）。開啟與官方 OWT 相同的 `post_upsample_conv` 後，生成器約為 101.69M。Tokenizer 是額外的模組，裡面含 23 本 4096×384 的碼本與兩張 50304×384 的表層嵌入。
 
 ## 安裝（CUDA GPU）
 
@@ -96,20 +96,49 @@ python generate.py --config config/gpt1.yaml --n 4 --temperature 1.0 --show_leve
 
 - `--data path/to/corpus.txt` 與 `--hf_dataset` 可並用。`--hf_dataset` 需要可選套件：`pip install datasets`。
 - 預設 batch size 為 16（約 16 GiB 顯存、bf16）。若發生 OOM，改傳 `--batch_size 8`；顯存還有餘裕可試 32。
-- 原始 GPT-1 用的是 BooksCorpus，取得不易，建議 TinyStories 或自備文本。
-- 可 `--resume` 續訓；tokenizer 存成 `artifacts/tokenizer/tokenizer.pt`（鍵名 `model`），generator 存成 `artifacts/generator/generator.pt`（`model` + `inference.level0_unigram`）。
+- 原始 GPT-1 用的是 BooksCorpus。開源接近項是 `lucadiliello/bookcorpusopen`（Kaggle 預設）；也可用 TinyStories 或自備文本。HuggingFace 資料集改為串流讀取，避免一次載入整份語料。
+- 可 `--resume` 或 `--resume auto` 續訓（會找 `latest.pt`）。檢查點是先寫暫存再替換，並存下 GradScaler；`torch.compile` / DDP 的權重在存檔時會先解開。中間 step 檔只保留最新兩個，以免把磁碟塞滿。
+- 多卡：`torchrun --nproc_per_node=2 train_tokenizer.py ...`（generator 同理）。batch size 是**每張 GPU** 的大小。VQ 碼本 EMA 已跨卡同步，死碼重啟只在 rank 0 執行再廣播。
+- 日誌每 `--log_every` 步（預設 50）印損失、速度（steps/s、tokens/s）、顯存，並寫入 `*_log.jsonl` 與 `status.json`。可用 `--max_hours` / `--reserve_minutes` 在時限前存檔退出，`--max_windows` / `--max_docs` 限制打包量。
 - 有 CUDA 時預設開混合精度，不必再加 `--amp`。`--no-amp` 可改回 fp32；`--device cpu` 可強制用 CPU。
-- 有 CUDA 時預設嘗試 `torch.compile`（失敗會自動退回一般模式）。`--no-compile` 可關閉。
-- GPT-1 設定已開啟 Flex Attention（`use_flex_attention: true`），用區塊稀疏核跑區塊對角遮罩。若啟動失敗，把該項改回 `false` 即可退回一般 SDPA。
+- 有 CUDA 時預設嘗試 `torch.compile`（失敗會自動退回一般模式）。`--no-compile` 可關閉。Kaggle 上預設關閉 compile。
+- 本機 `gpt1.yaml` 開啟 Flex Attention。若啟動失敗，把該項改回 `false`，會改走等價的分層 SDPA。
 - 生成前會先用「句 → 片語 → 詞」切開（`splitter`，預設規則切分）。訓練時視窗會盡量在句界開始；生成展開時，粗層對應句子、中層對應片語、細層對應詞，只細化仍不確定的單位。可用 `python scripts/diagnose_split.py --file data/smoke_corpus.txt` 查看切分樹。若要改用小型神經切分器，跑 `python train_splitter.py --config config/gpt1.yaml`，再把 `splitter.backend` 設成 `model`。
 - 預設「只在需要時才展開」：生成時若目前解碼已經夠確定且穩定，就提前停掉後面的層；同一層裡高把握的片段（類似圖像的黑背景）不再細化，改加接近 0 的殘差。可用 `--no-adaptive` 關閉。tokenizer 訓練也會依殘差能量跳過過弱的 cell。可用 `python scripts/diagnose_expand.py --tokenizer_ckpt ...` 查看每一層的殘差與把握度。
 
 無條件前綴是一顆 GPT-2 EOS（shape `(B, 1)`）。`generate.py --show_levels` 會把每一層的中間重建印出來，方便看由粗到細的過程。
 
+
+## 在 Kaggle 用約 30 GPU 小時訓練（T4 × 2）
+
+Kaggle 每週約 30 個 GPU 小時，單場最長 12 小時，T4 × 2 共 32 GiB（兩張 16 GiB，不是一張 32 GiB）。T4 沒有硬體 bf16，訓練走 fp16 + GradScaler。請開 Internet，並用 **Save & Run All**。
+
+1. 上傳 [`notebooks/kaggle_train.ipynb`](notebooks/kaggle_train.ipynb)，Accelerator 選 **GPU T4 x2**。
+2. notebook 會 clone 本倉庫、安裝 `omegaconf hydra-core datasets regex`（**不要重裝 torch**），然後執行：
+
+```bash
+python scripts/train_kaggle.py --hours 11.5 --output_dir /kaggle/working/artifacts
+```
+
+3. 編排腳本先訓練 tokenizer，完成後再用剩餘時間訓練 generator。時間到會存 `latest.pt` 並退出。把該場 Output 加成下一場的 Input dataset，再跑一次同一份 notebook 就會自動續訓。
+4. 預設語料是 BookCorpus 開源重建版；若下載失敗，會改用 MiniPile，再不行才用 TinyStories。設定在 `config/kaggle.yaml`（Flex 關閉、每卡 batch 8、每 1000 步存檔）。
+5. 日誌在 `artifacts/tokenizer/tokenizer_log.jsonl` 與 `artifacts/generator/generator_log.jsonl`。`status.json` 的 `finished: true` 代表該階段已跑完設定的 `max_steps`（預設各 10 萬步）。
+
+雙 T4 + 分層注意力，完整 10 萬 + 10 萬步有機會在約 30 小時內分幾場跑完，但仍取決於實際 steps/s。若顯存不足，把 `--batch_size` 改成 4。
+
+多卡本機等價指令：
+
+```bash
+torchrun --nproc_per_node=2 train_tokenizer.py --config config/kaggle.yaml \
+    --hf_dataset lucadiliello/bookcorpusopen --resume auto --max_hours 11.5 --no-compile
+```
+
 ## 官方程式碼與已知細節
 
 - 核心模型**沒有重寫**，只多註冊了一個煙霧測試用的字元 tokenizer（`tokenization/char_tokenizer.py`）。
-- 官方 `VQVAE.reconstruct` 把 `vq()` 解包成 3 個值，但 `forward` 實際回傳 5 個；本專案的訓練與生成都不呼叫 `reconstruct()`。
+- 官方 `VQVAE.reconstruct` 曾把 `vq()` 解包成 3 個值（`forward` 實際回傳 5 個）；本專案已改成安全解包。
+- 與官方 OWT 文字設定對齊：`post_upsample_conv` 開啟（零初始化、可學習）、綁定碼本輸出頭時也開 `tie_heads_bias`。
+- 生成器序列長度是前綴 + 各層碼（約 4307），不是 512。訓練時預設用**分層 SDPA**（與區塊對角遮罩等價，不必撐起整張 4307×4307 注意力矩陣）。本機 `gpt1.yaml` 仍可開 Flex Attention；Kaggle T4（sm_75）請關 Flex、走分層路徑。
 - `n_layers` 在 VQ-VAE 的 Encoder / Decoder 裡是**注意力頭數**，不是層數；深度由 `enc_layers`（預設 0）與 `dec_layers`（預設 1）決定。
 - 加入 gpt2 的 `<|pad|>` 後，pad id 通常是 50257（與官方 OWT 設定相同）。訓練與生成會以實際 tokenizer 為準，不硬假設這個數字。
 

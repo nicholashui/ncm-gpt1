@@ -17,6 +17,20 @@ from utils.misc import count_params
 from utils.registry import tokenizers
 import hydra
 
+# Forwarders so maybe_compile can log on the main rank only. Real helpers are at the bottom.
+def is_main_process() -> bool:
+    try:
+        import torch.distributed as dist
+        return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+    except Exception:
+        return True
+
+
+def dist_print(*args, **kwargs):
+    if is_main_process():
+        print(*args, **kwargs)
+
+
 
 def set_seed(seed: int):
     seed = int(seed)
@@ -100,10 +114,10 @@ def maybe_compile(module, enabled: bool, name: str = "model"):
         return module
     try:
         compiled = torch.compile(module)
-        print(f"torch.compile enabled for {name}")
+        dist_print(f"torch.compile enabled for {name}")
         return compiled
     except Exception as exc:
-        print(f"torch.compile failed for {name} ({exc!r}); continuing without it")
+        dist_print(f"torch.compile failed for {name} ({exc!r}); continuing without it")
         return module
 
 
@@ -132,6 +146,7 @@ def add_device_args(parser):
         default=None,
         help="DataLoader workers (default: 0 on Windows, 2 on CUDA elsewhere)",
     )
+    add_runtime_args(parser)
     return parser
 
 
@@ -203,7 +218,7 @@ def level_weights(levels, alpha: float, device=None, dtype=torch.float32):
     return ell.pow(-float(alpha)) / denom
 
 
-def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0):
+def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0, return_parts=False):
     """Per-position CE, weighted by w_k, sliced to each level's true vocab size.
 
     When alpha=0 this equals the mean CE over all predicted code positions.
@@ -214,6 +229,7 @@ def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0):
     device = logits.device
     w = level_weights(levels, alpha, device=device, dtype=torch.float32)
     total = logits.new_zeros(())
+    parts = []
     offset = 0
     for k, (ell, vk) in enumerate(zip(levels, vocab_sizes)):
         ell, vk = int(ell), int(vk)
@@ -221,8 +237,12 @@ def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0):
         tg = targets[:, offset : offset + ell].reshape(-1)
         ce = F.cross_entropy(lg, tg, reduction="none")
         total = total + (ce * w[k]).sum()
+        parts.append(float(ce.mean().detach()))
         offset += ell
-    return total / B
+    loss = total / B
+    if return_parts:
+        return loss, parts
+    return loss
 
 
 def corrupt_codes(idx, levels, vocab_sizes, p_max=0.8, p_min=0.2):
@@ -271,12 +291,234 @@ def param_counts(model, exclude=None):
 
 
 def save_checkpoint(path, payload):
+    """Atomic checkpoint write (tmp + os.replace). Call only on the main rank."""
+    import os
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
 
 
 def maybe_copy_config(cfg, dest_dir):
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, dest / "config.yaml")
+
+
+def add_runtime_args(parser):
+    """Wall-clock budget and corpus caps, used by Kaggle / long GPU sessions."""
+    parser.add_argument(
+        "--max_hours",
+        type=float,
+        default=None,
+        help="stop this run after this many hours (saves a checkpoint first)",
+    )
+    parser.add_argument(
+        "--reserve_minutes",
+        type=float,
+        default=10.0,
+        help="minutes reserved at the end of --max_hours for saving",
+    )
+    parser.add_argument("--max_docs", type=int, default=None, help="cap documents packed from --data / --hf_dataset")
+    parser.add_argument("--max_windows", type=int, default=None, help="cap packed training windows")
+    return parser
+
+
+def get_rank() -> int:
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank())
+    except Exception:
+        pass
+    return 0
+
+
+def get_world_size() -> int:
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_world_size())
+    except Exception:
+        pass
+    return 1
+
+
+def init_distributed(device_name: str | None = None):
+    """Bind this process to its GPU when launched with torchrun.
+
+    Returns (device, rank, world_size, local_rank). A plain `python train_*.py`
+    launch is unchanged (world_size=1).
+    """
+    import os
+    if os.environ.get("RANK") is None:
+        device = resolve_device(device_name)
+        return device, 0, 1, 0
+    import torch.distributed as dist
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if not torch.cuda.is_available():
+        raise RuntimeError("torchrun DDP requires CUDA")
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    device = torch.device(f"cuda:{local_rank}")
+    return device, rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
+
+def wrap_ddp(model, local_rank: int, world_size: int, find_unused_parameters: bool = False):
+    if world_size <= 1:
+        return model
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    return DDP(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=find_unused_parameters,
+        broadcast_buffers=False,
+    )
+
+
+def unwrap_model(model):
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    if isinstance(model, DDP):
+        model = model.module
+    return getattr(model, "_orig_mod", model)
+
+
+def module_state_dict(model):
+    return unwrap_model(model).state_dict()
+
+
+def load_module_state(model, state, strict=True):
+    if state and any(k.startswith("_orig_mod.") for k in state):
+        state = {k[10:] if k.startswith("_orig_mod.") else k: v for k, v in state.items()}
+    unwrap_model(model).load_state_dict(state, strict=strict)
+
+
+def resolve_resume(resume, output_dir, preferred=("latest.pt",)):
+    if resume is None:
+        return None
+    if str(resume) != "auto":
+        path = Path(resume)
+        if not path.is_file():
+            raise SystemExit(f"resume checkpoint not found: {resume}")
+        return str(path)
+    out = Path(output_dir)
+    for name in preferred:
+        path = out / name
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def write_run_status(out_dir, step, max_steps, finished, extra=None):
+    import json
+    payload = {"step": int(step), "max_steps": int(max_steps), "finished": bool(finished)}
+    if extra:
+        payload.update(extra)
+    path = Path(out_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "status.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def all_reduce_sum(value, device):
+    t = torch.tensor([float(value)], device=device, dtype=torch.float64)
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    except Exception:
+        pass
+    return float(t.item())
+
+
+class TimeBudget:
+    def __init__(self, max_hours=None, reserve_minutes=10.0):
+        import time
+        self._time = time
+        self.start = time.monotonic()
+        self.max_seconds = None if max_hours in (None, 0) else float(max_hours) * 3600.0
+        self.reserve = float(reserve_minutes or 0.0) * 60.0
+
+    def should_stop(self):
+        if self.max_seconds is None:
+            return False
+        return (self._time.monotonic() - self.start) >= (self.max_seconds - self.reserve)
+
+    def elapsed_hours(self):
+        return (self._time.monotonic() - self.start) / 3600.0
+
+
+class ThroughputMeter:
+    def __init__(self):
+        import time
+        self._time = time
+        self.reset()
+
+    def update(self, n_tokens, n_steps=1):
+        self.tokens += int(n_tokens)
+        self.steps += int(n_steps)
+
+    def rate(self):
+        dt = max(self._time.perf_counter() - self.t0, 1e-9)
+        return self.steps / dt, self.tokens / dt
+
+    def reset(self):
+        self.t0 = self._time.perf_counter()
+        self.tokens = 0
+        self.steps = 0
+
+
+def cuda_mem_gb():
+    if not torch.cuda.is_available():
+        return 0.0
+    return float(torch.cuda.max_memory_allocated()) / (1024 ** 3)
+
+
+def prune_checkpoints(out_dir, pattern, keep=2):
+    """Keep the newest `keep` files matching a glob, delete the rest."""
+    out = Path(out_dir)
+    files = [p for p in out.glob(pattern) if p.is_file() and not p.name.endswith(".tmp")]
+    files.sort(key=lambda p: p.stat().st_mtime)
+    for path in files[:-int(keep)]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+class TrainLogger:
+    """Rank-0 stdout + JSONL log for long Kaggle / multi-session runs."""
+
+    def __init__(self, out_dir, name):
+        self.enabled = is_main_process()
+        self.path = Path(out_dir) / f"{name}_log.jsonl"
+        if self.enabled:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, **fields):
+        import json
+        from datetime import datetime, timezone, timedelta
+        rec = {
+            "time": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
+            **fields,
+        }
+        if not self.enabled:
+            return rec
+        line = json.dumps(rec, ensure_ascii=False, default=str)
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        return rec

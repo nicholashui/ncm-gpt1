@@ -528,7 +528,13 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
                 ema_w.data.mul_(decay).add_(dw, alpha=1 - decay)
                 emb_i.weight.data.copy_(ema_w.data / smoothed.unsqueeze(1))
                 if self.restart_threshold > 0:
-                    self._restart_dead_codes(flat_input.detach(), ema_cs.data, ema_w.data, emb_i)
+                    # Only rank 0 restarts; broadcast so codebook EMA stays aligned under DDP.
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        self._restart_dead_codes(flat_input.detach(), ema_cs.data, ema_w.data, emb_i)
+                    if dist.is_initialized():
+                        dist.broadcast(emb_i.weight.data, 0)
+                        dist.broadcast(ema_w.data, 0)
+                        dist.broadcast(ema_cs.data, 0)
 
             q_BLC = emb_i(indices)
             # Straight-through estimator at level 0 only; at higher levels it diverges within ~100 steps.

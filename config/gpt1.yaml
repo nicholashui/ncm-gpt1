@@ -94,9 +94,9 @@ model:
   context_length: 513     # prefix 1 + L, official pattern
   prefix_len: 1
   raw_token_prefix: true
-  # gpt2 vocab is 50257 (ids 0-50256); adding <|pad|> yields 50257.
-  # train_generator.py / generate.py overwrite this from the real tokenizer
-  # if add_special_tokens ever shifts it.
+  # gpt2 vocab is 50257 (ids 0-50256); adding <|pad|> gives 50258 tokens, pad id 50257.
+  # in_vocab_size is padded to 50304 (multiple of 64). train_generator.py / generate.py
+  # overwrite prefix_pad_token_id from the live tokenizer if special tokens shift it.
   prefix_pad_token_id: 50257
   # 22 heads (K-1). query_level0=false, predict_level0=false: level 0 is NOT
   # predicted by the transformer; it is sampled from a training unigram.
@@ -136,11 +136,16 @@ model:
     n_layer: 4
     vocab_size: 50304
   use_flex_attention: true
+  # Chunked block-diagonal SDPA is the default when Flex is off (needed on T4).
+  use_chunked_block_attn: true
+  # Official OWT text models enable this residual conv after each upsample.
   post_upsample_conv:
-    enabled: false
-  # TinyStories: tied codebook heads with a learned temperature scale; bias off.
+    enabled: true
+    kernel_size: 3
+  # Tied codebook heads with a learned temperature; bias on, as in official OWT.
   tie_heads_to_codebook: true
   tie_heads_learn_scale: true
+  tie_heads_bias: true
 
 train:
   tokenizer:

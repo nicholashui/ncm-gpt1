@@ -30,6 +30,43 @@ def apply_rotary_emb(x, cos, sin):
     return x * cos + rotated * sin
 
 
+
+def chunked_block_diagonal_sdpa(q, k, v, prefix_len, level_lens, dropout_p=0.0):
+    """SDPA equivalent to the NCM block-diagonal + prefix mask, without an SxS matrix.
+
+    Prefix tokens attend only to the prefix. Each level attends to the prefix plus
+    its own cells. At dropout_p=0 this matches a dense -inf mask.
+    """
+    outs = []
+    P = int(prefix_len)
+    if P > 0:
+        outs.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                q[:, :, :P], k[:, :, :P], v[:, :, :P],
+                dropout_p=dropout_p, is_causal=False,
+            )
+        )
+    off = P
+    for length in level_lens:
+        length = int(length)
+        if length <= 0:
+            continue
+        qk = q[:, :, off:off + length]
+        if P > 0:
+            kk = torch.cat([k[:, :, :P], k[:, :, off:off + length]], dim=2)
+            vv = torch.cat([v[:, :, :P], v[:, :, off:off + length]], dim=2)
+        else:
+            kk = k[:, :, off:off + length]
+            vv = v[:, :, off:off + length]
+        outs.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                qk, kk, vv, dropout_p=dropout_p, is_causal=False,
+            )
+        )
+        off += length
+    return torch.cat(outs, dim=2) if outs else q
+
+
 class LayerNorm(nn.Module):
     def __init__(self, ndim, bias=False):
         super().__init__()
@@ -84,7 +121,7 @@ class SelfAttention(nn.Module):
         self.caching, self.cached_k, self.cached_v = enable, None, None
 
 
-    def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None):
+    def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None, block_layout=None):
         B, T, C = x.size()
         q, k, v = self.c_attn(x).split([self.n_embd, self._kv_dim, self._kv_dim], dim=2)
         hd = C // self.n_head
@@ -117,16 +154,22 @@ class SelfAttention(nn.Module):
                 k = self.cached_k = torch.cat([self.cached_k, k], dim=2)
                 v = self.cached_v = torch.cat([self.cached_v, v], dim=2)
 
+        drop_p = self.dropout if self.training else 0.0
         if block_mask is not None:
             # flex_attention is not autocast-aware, so align q/k to v's dtype by hand.
             if q.dtype != v.dtype:
                 q = q.to(v.dtype)
                 k = k.to(v.dtype)
             y = _flex_attention(q, k, v, block_mask=block_mask)
+        elif block_layout is not None and not self.caching:
+            prefix_len, level_lens = block_layout
+            y = chunked_block_diagonal_sdpa(q, k, v, prefix_len, level_lens, dropout_p=drop_p)
         else:
             # Causal only for multiple tokens with no explicit mask; a cached single token sees all.
             use_causal = True if attn_mask is None and T > 1 else False
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0, is_causal=use_causal)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=drop_p, is_causal=use_causal
+            )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         y = self.resid_dropout(self.c_proj(y))
@@ -194,15 +237,15 @@ class Block(nn.Module):
             return (self.rz1 if which == 1 else self.rz2) * h
         return h
 
-    def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None):
+    def forward(self, x, attn_mask=None, rope_cos_sin=None, block_mask=None, block_layout=None):
         if self.parallel_block:
             n = self.ln_1(x)
-            a = self.attn(n, attn_mask, rope_cos_sin=rope_cos_sin, block_mask=block_mask)
+            a = self.attn(n, attn_mask, rope_cos_sin=rope_cos_sin, block_mask=block_mask, block_layout=block_layout)
             m = self.mlp(n)
             if self.normformer:
                 a = self.ln_post_attn(a); m = self.ln_post_mlp(m)
             return x + self._ls_scale(a, 1) + self._ls_scale(m, 2)
-        a = self.attn(self.ln_1(x), attn_mask, rope_cos_sin=rope_cos_sin, block_mask=block_mask)
+        a = self.attn(self.ln_1(x), attn_mask, rope_cos_sin=rope_cos_sin, block_mask=block_mask, block_layout=block_layout)
         if self.normformer:
             a = self.ln_post_attn(a)
         x = x + self._ls_scale(a, 1)
