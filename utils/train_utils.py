@@ -82,7 +82,10 @@ def setup_amp(device: torch.device, amp_flag: bool | None):
         if want and device.type != "cuda":
             print("AMP requested but CUDA is unavailable; running fp32 on CPU")
         return nullcontext(), None, "fp32"
-    if torch.cuda.is_bf16_supported():
+    # T4 (sm_75) reports is_bf16_supported() on some PyTorch builds but has no
+    # native bf16 Tensor Cores; emulated bf16 wastes memory. Require sm >= 80.
+    cap = torch.cuda.get_device_capability(device)
+    if cap[0] >= 8 and torch.cuda.is_bf16_supported():
         ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return ctx, None, "bf16"
     scaler = torch.amp.GradScaler("cuda")

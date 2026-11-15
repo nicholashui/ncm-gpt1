@@ -143,6 +143,8 @@ model:
   use_flex_attention: false
   # Chunked block-diagonal SDPA is the default when Flex is off (needed on T4).
   use_chunked_block_attn: true
+  # Recompute each generator block; needed to fit seq ~4307 on a 16 GiB T4.
+  gradient_checkpointing: true
   # Official OWT text models enable this residual conv after each upsample.
   post_upsample_conv:
     enabled: true
@@ -167,7 +169,8 @@ train:
     save_every: 1000
     pack_repeat: 1
   generator:
-    batch_size: 8
+    # T4 14.56 GiB still OOMs at batch 4 without checkpointing; use 2 per GPU.
+    batch_size: 2
     peak_lr: 3.0e-4
     floor_lr: 3.0e-5
     warmup: 500

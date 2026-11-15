@@ -437,24 +437,44 @@ class NextConceptTransformer(Transformer):
     def _run_stack(self, prefix_emb, x, prefix_pad_mask=None):
         x = torch.cat([prefix_emb, x], dim=1)
 
-        attn_mask = self.attn_mask_for_masking
-        if prefix_pad_mask is not None:
-            attn_mask = attn_mask + self._prefix_pad_bias(
-                prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
-
-        rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
         use_chunked = bool(getattr(self.config, "use_chunked_block_attn", True))
+        use_ckpt = bool(self.training and getattr(self.config, "gradient_checkpointing", False))
+        rope = (self.rope_cos, self.rope_sin) if self.use_rope else None
+
+        # The dense P+T mask is only needed when chunked/flex attention is off.
+        attn_mask = None
+        if not self.use_flex_attention and not use_chunked:
+            attn_mask = self.attn_mask_for_masking
+            if prefix_pad_mask is not None:
+                attn_mask = attn_mask + self._prefix_pad_bias(
+                    prefix_pad_mask, x.shape[1], attn_mask.dtype, x.device)
+
+        def _maybe_ckpt(fn, hidden):
+            if not use_ckpt:
+                return fn(hidden)
+            from torch.utils.checkpoint import checkpoint
+            return checkpoint(fn, hidden, use_reentrant=False)
+
         if self.use_flex_attention:
             block_mask = self._get_flex_block_mask(x.device)
             for block in self.transformer.blocks:
-                x = block(x, rope_cos_sin=rope, block_mask=block_mask)
+                x = _maybe_ckpt(
+                    lambda hidden, b=block: b(hidden, rope_cos_sin=rope, block_mask=block_mask),
+                    x,
+                )
         elif use_chunked:
             layout = (self.prefix_len, tuple(int(l) for l in self.levels[self._lvl_first:]))
             for block in self.transformer.blocks:
-                x = block(x, attn_mask=attn_mask, rope_cos_sin=rope, block_layout=layout)
+                x = _maybe_ckpt(
+                    lambda hidden, b=block: b(hidden, rope_cos_sin=rope, block_layout=layout),
+                    x,
+                )
         else:
             for block in self.transformer.blocks:
-                x = block(x, attn_mask=attn_mask, rope_cos_sin=rope)
+                x = _maybe_ckpt(
+                    lambda hidden, b=block, m=attn_mask: b(hidden, attn_mask=m, rope_cos_sin=rope),
+                    x,
+                )
         x = self.transformer.ln_f(x)
 
         x_target = x[:, self.prefix_len:, :]

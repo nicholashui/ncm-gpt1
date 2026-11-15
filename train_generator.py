@@ -80,6 +80,8 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=None)
     p.add_argument("--save_every", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="recompute each transformer block during backward (saves VRAM)")
     p.add_argument("--resume", default=None, help="checkpoint path, or 'auto' to use output_dir/latest.pt")
     add_device_args(p)
     p.add_argument("--seed", type=int, default=None)
@@ -112,6 +114,8 @@ def main():
 
     gcfg = cfg.train.generator
     batch_size = int(args.batch_size or gcfg.batch_size)
+    if args.gradient_checkpointing:
+        cfg.model.gradient_checkpointing = True
     max_steps = int(args.max_steps or gcfg.max_steps)
     save_every = int(args.save_every or gcfg.get("save_every", max_steps))
     warmup = int(gcfg.warmup)
@@ -205,7 +209,10 @@ def main():
     autocast, scaler, amp_dtype = setup_amp(device, args.amp)
     if scaler is not None and scaler_state is not None:
         scaler.load_state_dict(scaler_state)
-    dist_print(f"amp={amp_dtype}  compile={use_compile}  device={device}")
+    dist_print(
+        f"amp={amp_dtype}  compile={use_compile}  device={device}"
+        f"  checkpoint={bool(getattr(cfg.model, 'gradient_checkpointing', False))}"
+    )
 
     out_dir = Path(args.output_dir)
     if is_main_process():
