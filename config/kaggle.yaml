@@ -1,6 +1,7 @@
 # Kaggle T4 x2 training config (GPT-1-scale NCM, book-like data).
 # Flex Attention is off (Turing / sm_75). Use chunked block-diagonal SDPA instead.
-# Batch 8 per GPU (effective 16 with two T4s). Resume across 12-hour sessions.
+# Generator default is batch 4 per GPU with gradient checkpointing (effective 8
+# on two T4s). Resume across 12-hour sessions. alpha=0.5 below is NOT the paper ELBO.
 # Default corpus is an open BookCorpus recreation (GPT-1's domain); the
 # orchestrator falls back if the Hub dataset is unavailable.
 # GPT-1 scale Next-Concept Model (not a clone of 2018 GPT-1 weights).
@@ -169,8 +170,11 @@ train:
     save_every: 1000
     pack_repeat: 1
   generator:
-    # T4 14.56 GiB still OOMs at batch 4 without checkpointing; use 2 per GPU.
-    batch_size: 2
+    # v5 fit batch 2 with checkpointing (~3.3 GiB of 14.56 GiB). Batch 4
+    # without checkpointing OOM'd on kernel v4. Checkpointing stays on;
+    # default is now 4 per GPU. Try 8 only after a run shows 4 fits.
+    # --batch_size still overrides this.
+    batch_size: 4
     peak_lr: 3.0e-4
     floor_lr: 3.0e-5
     warmup: 500
@@ -179,10 +183,19 @@ train:
     grad_clip: 1.0
     max_steps: 100000
     save_every: 1000
-    alpha: 0.0            # every code position equal (matches ELBO)
+    # DEPARTS FROM THE PAPER ELBO. alpha=0 weights every code position
+    # equally, so the 512-cell level dominates and mid/coarse CE lagged in
+    # v5 (~26% improvement vs ~77% on the finest level). alpha=0.5 shifts
+    # weight onto shorter levels. gpt1.yaml / smoke.yaml stay at 0.
+    # Resuming step 27595 with this value changes the loss mid-run.
+    alpha: 0.5
     corrupt_p_max: 0.8    # linearly decreasing corruption, mean rate 0.50
     corrupt_p_min: 0.2
     pack_repeat: 1
+    # Rank-0 forward-only tail. Batch 1: eval turns checkpointing off.
+    val_every: 1000
+    val_windows: 256
+    val_batch_size: 1
 
 generation:
   temperature: 1.0
@@ -208,7 +221,10 @@ generation:
 
 # Split text first: sentence → phrase → word. Windows pack at sentence
 # boundaries. Generation expands a cell only if the overlapping unit is uncertain.
-# backend=rules works immediately; train_splitter.py can fit a tiny tagger, then set backend: model.
+# backend=rules works immediately and has no learned weights. Training still
+# packs on sentence boundaries and writes artifacts/splitter/status.json so
+# this is not a silent no-op. train_splitter.py can fit a tiny tagger, then
+# set backend: model. guide_expand applies when generating.
 splitter:
   enabled: true
   backend: rules
@@ -217,9 +233,17 @@ splitter:
   guide_expand: true
   unit: auto
 
-# Open BookCorpus recreation, streamed and capped so packing fits in ~29 GB RAM.
+# Open BookCorpus recreation, streamed. v5 used max_windows 65536
+# (~33.6M tokens) and the generator lapped that slice ~1.7 times.
+# 524288 windows is 8× (~268M tokens). Rank 0 packs into an int32 buffer
+# (~1 GiB); each rank then holds an int64 tensor (~2 GiB). Two processes
+# stay well under Kaggle's ~29 GiB. The tensor is cached at
+# artifacts/packed_windows.pt so a later resume with the same cap does not
+# pack again. The full BookCorpusOpen stream is not the default: packing
+# it can spend a large part of a 12h session. Changing this cap on resume
+# from step 27595 is intentional; checkpoints do not store the window order.
 data:
   hf_dataset: lucadiliello/bookcorpusopen
   hf_split: train
   hf_text_field: text
-  max_windows: 65536
+  max_windows: 524288

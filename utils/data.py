@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import array
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -71,30 +73,61 @@ def iter_documents_from_hf(name, split="train", text_field="text", config_name=N
                 return
 
 
+def _push_window(rows, ids, L, pad, cap):
+    """Append one length-L window as a compact uint32 row. Returns False at cap."""
+    if cap and len(rows) >= cap:
+        return False
+    seq = [int(x) for x in ids]
+    if len(seq) < L:
+        seq.extend([pad] * (L - len(seq)))
+    elif len(seq) > L:
+        seq = seq[:L]
+    rows.append(array.array("I", seq))
+    return True
+
+
+def _rows_to_tensor(rows, L):
+    """Materialize packed rows as an int64 tensor without a giant list of Python ints."""
+    if not rows:
+        return torch.empty(0, L, dtype=torch.long)
+    buf = array.array("I")
+    for row in rows:
+        buf.extend(row)
+    raw = torch.frombuffer(bytearray(buf), dtype=torch.int32).clone()
+    return raw.to(dtype=torch.long).view(-1, L)
+
+
 def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repeat=1, respect_sentences=False, max_windows=0):
     """Encode documents, append EOS, and pack/pad to length L.
 
     When respect_sentences is True, a new window starts at a sentence boundary
     whenever the next sentence would overflow the current window. A sentence
     longer than L is packed by tokens as usual.
+
+    Windows are stored as uint32 rows while streaming so a few hundred thousand
+    windows stay near 1 GiB instead of a multi-gigabyte list of Python ints.
+    The returned tensor is still int64, matching the previous packing result.
     """
     eos = int(pre_tokenizer.eos_token_id)
     pad = int(pre_tokenizer.pad_token_id)
     L = int(context_length)
     n_docs = 0
     n_toks = 0
-    windows = []
+    rows = []
     cap = int(max_windows or 0)
 
     def enough():
-        return cap > 0 and len(windows) >= cap
+        return cap > 0 and len(rows) >= cap
 
-    def flush(cur):
-        if not cur:
-            return []
-        if len(cur) < L:
-            return cur + [pad] * (L - len(cur))
-        return cur[:L]
+    def push(ids):
+        return _push_window(rows, ids, L, pad, cap)
+
+    def note_progress():
+        if cap >= 65536 and n_docs and n_docs % 5000 == 0:
+            print(
+                f"packing... docs={n_docs} windows={len(rows)} tokens={n_toks}",
+                flush=True,
+            )
 
     if respect_sentences:
         from utils.linguistic import split_sentences
@@ -112,19 +145,19 @@ def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repe
                     n_toks += len(ids)
                     if len(ids) > L:
                         if cur:
-                            windows.append(flush(cur))
+                            push(cur)
                             cur = []
                         for i in range(0, len(ids), L):
                             if enough():
                                 break
                             chunk = ids[i:i + L]
                             if len(chunk) == L:
-                                windows.append(chunk)
+                                push(chunk)
                             else:
                                 cur = list(chunk)
                         continue
                     if cur and len(cur) + len(ids) > L:
-                        windows.append(flush(cur))
+                        push(cur)
                         cur = []
                     cur.extend(ids)
                     if enough():
@@ -132,35 +165,37 @@ def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repe
                 if wrote:
                     n_docs += 1
                     if len(cur) >= L:
-                        windows.append(cur[:L])
+                        push(cur[:L])
                         cur = cur[L:]
                     if not enough():
                         if len(cur) + 1 <= L:
                             cur.append(eos)
                             n_toks += 1
                         else:
-                            windows.append(flush(cur))
+                            push(cur)
                             cur = [eos]
                             n_toks += 1
+                    note_progress()
                 if enough():
                     stop = True
                     break
             if stop or enough():
                 break
         if cur and not enough():
-            windows.append(flush(cur))
-        if not windows:
+            push(cur)
+        if not rows:
             raise ValueError("no tokens produced from the given documents")
     else:
-        stream = []
+        stream = array.array("I")
         for _ in range(max(int(repeat), 1)):
             for text in documents:
                 ids = pre_tokenizer.encode(text)
                 if not ids:
                     continue
-                stream.extend(ids)
+                stream.extend(int(x) for x in ids)
                 stream.append(eos)
                 n_docs += 1
+                note_progress()
                 if cap and len(stream) >= cap * L:
                     break
             if cap and len(stream) >= cap * L:
@@ -174,17 +209,162 @@ def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repe
             chunk = stream[i:i + L]
             if not chunk:
                 continue
-            if len(chunk) < L:
-                chunk = chunk + [pad] * (L - len(chunk))
-            windows.append(chunk)
+            push(chunk)
 
-    if cap and len(windows) > cap:
-        windows = windows[:cap]
-    if min_windows and len(windows) < min_windows:
-        reps = (min_windows + len(windows) - 1) // len(windows)
-        windows = windows * reps
-    data = torch.tensor(windows, dtype=torch.long)
+    if cap and len(rows) > cap:
+        del rows[cap:]
+    if min_windows and len(rows) < min_windows:
+        reps = (min_windows + len(rows) - 1) // len(rows)
+        rows = rows * reps
+    data = _rows_to_tensor(rows, L)
     return data, n_docs, n_toks
+
+
+def split_heldout_windows(windows: torch.Tensor, n_val: int, min_train: int = 1):
+    """Hold out a deterministic tail. The train prefix is not reshuffled.
+
+    Returns the original tensor when the pool is too small to spare `n_val`
+    windows and still leave `min_train` for the DistributedSampler.
+    """
+    n_val = int(n_val or 0)
+    min_train = max(int(min_train or 0), 0)
+    n = int(windows.shape[0]) if windows is not None and windows.ndim == 2 else 0
+    if n_val <= 0 or n <= n_val + min_train:
+        empty = windows.new_empty((0, windows.shape[1])) if windows is not None and windows.ndim == 2 else windows
+        return windows, empty
+    return windows[:-n_val], windows[-n_val:]
+
+
+def corpus_cache_meta(args, L, max_windows, respect_sentences, pack_repeat, eos, pad):
+    """Identity of a packed pool. A mismatch rebuilds artifacts/packed_windows.pt."""
+    max_docs = getattr(args, "max_docs", None)
+    return {
+        "L": int(L),
+        "max_windows": int(max_windows or 0),
+        "respect_sentences": bool(respect_sentences),
+        "pack_repeat": int(pack_repeat),
+        "eos": int(eos),
+        "pad": int(pad),
+        "hf_dataset": str(getattr(args, "hf_dataset", None) or ""),
+        "hf_split": str(getattr(args, "hf_split", None) or ""),
+        "hf_text_field": str(getattr(args, "hf_text_field", None) or ""),
+        "data": str(getattr(args, "data", None) or ""),
+        "max_docs": int(max_docs) if max_docs else 0,
+    }
+
+
+def _cache_matches(saved, expect) -> bool:
+    if not isinstance(saved, dict) or not isinstance(expect, dict):
+        return False
+    return all(saved.get(k) == expect.get(k) for k in expect)
+
+
+def _atomic_torch_save(path: Path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _load_packed_cache(path: Path, expect):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"ignoring packed-window cache {path} ({exc!r})", flush=True)
+        return None
+    if not _cache_matches(payload.get("meta"), expect):
+        return None
+    windows = payload.get("windows")
+    if not torch.is_tensor(windows) or windows.ndim != 2:
+        return None
+    return windows.to(dtype=torch.long), int(payload.get("n_docs", 0)), int(payload.get("n_toks", 0))
+
+
+def acquire_packed_windows(
+    documents,
+    pre_tokenizer,
+    context_length,
+    *,
+    min_windows,
+    repeat,
+    respect_sentences,
+    max_windows,
+    cache_path,
+    cache_meta,
+    rank=0,
+    world_size=1,
+):
+    """Pack on rank 0, or reuse a matching cache, then load the same tensor everywhere.
+
+    Both DDP ranks used to pack the full stream. A larger window cap would
+    double the RAM peak on a shared Kaggle host, so only rank 0 packs and
+    writes `cache_path`. Other ranks wait, then read that file. The sampler
+    still sees one identical window tensor on every rank.
+    """
+    cache_path = Path(cache_path) if cache_path else None
+    error_path = cache_path.with_name(cache_path.name + ".error") if cache_path is not None else None
+    if int(rank) == 0 and error_path is not None and error_path.exists():
+        error_path.unlink()
+    loaded = None
+    packed = False
+    windows = n_docs = n_toks = None
+    failure = None
+    if int(rank) == 0:
+        try:
+            if cache_path is not None:
+                loaded = _load_packed_cache(cache_path, cache_meta)
+            if loaded is None:
+                windows, n_docs, n_toks = pack_documents(
+                    documents,
+                    pre_tokenizer,
+                    context_length,
+                    min_windows=min_windows,
+                    repeat=repeat,
+                    respect_sentences=respect_sentences,
+                    max_windows=max_windows,
+                )
+                packed = True
+                if cache_path is not None:
+                    _atomic_torch_save(
+                        cache_path,
+                        {
+                            "windows": windows.to(dtype=torch.int32),
+                            "n_docs": int(n_docs),
+                            "n_toks": int(n_toks),
+                            "meta": dict(cache_meta),
+                        },
+                    )
+            else:
+                windows, n_docs, n_toks = loaded
+                print(
+                    f"loaded packed windows from {cache_path} "
+                    f"({len(windows)} windows, cap={cache_meta.get('max_windows')})",
+                    flush=True,
+                )
+        except Exception as exc:
+            failure = exc
+            if error_path is not None:
+                error_path.write_text(repr(exc), encoding="utf-8")
+    if int(world_size) > 1:
+        import torch.distributed as dist
+        # Always barrier, including after a rank-0 pack failure, so other ranks do not hang.
+        dist.barrier()
+        if int(rank) != 0:
+            if error_path is not None and error_path.is_file():
+                failure = RuntimeError(error_path.read_text(encoding="utf-8"))
+            else:
+                loaded = _load_packed_cache(cache_path, cache_meta) if cache_path is not None else None
+                if loaded is None:
+                    failure = RuntimeError(f"rank {rank} could not read packed windows at {cache_path}")
+                else:
+                    windows, n_docs, n_toks = loaded
+    if failure is not None:
+        raise failure
+    return windows, n_docs, n_toks, packed
 
 
 def default_workers(user_value=None, pin_memory=False):

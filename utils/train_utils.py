@@ -94,17 +94,56 @@ def setup_amp(device: torch.device, amp_flag: bool | None):
 
 
 def optimize(loss, opt, params, clip, scaler=None):
-    """Backward, clip, and step, with or without a GradScaler."""
+    """Backward, clip, and step, with or without a GradScaler.
+
+    Returns the total grad norm from before clipping (a Python float).
+    """
     if scaler is None:
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, clip)
         opt.step()
-        return
+        return float(grad_norm)
     scaler.scale(loss).backward()
     scaler.unscale_(opt)
-    torch.nn.utils.clip_grad_norm_(params, clip)
+    grad_norm = torch.nn.utils.clip_grad_norm_(params, clip)
     scaler.step(opt)
     scaler.update()
+    return float(grad_norm)
+
+
+def rank0_barrier_call(fn):
+    """Run `fn` on rank 0 between collectives so a val pass cannot deadlock DDP.
+
+    Every rank enters and leaves together. A failure on rank 0 is broadcast
+    as a flag, then re-raised, so the other ranks do not wait at the next
+    training all_reduce.
+    """
+    world = get_world_size()
+    if world > 1:
+        import torch.distributed as dist
+        dist.barrier()
+    result = None
+    error = None
+    if is_main_process():
+        try:
+            result = fn()
+        except Exception as exc:
+            error = exc
+    if world > 1:
+        import torch.distributed as dist
+        if torch.cuda.is_available():
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            device = torch.device("cpu")
+        flag = torch.tensor([0 if error is None else 1], device=device, dtype=torch.int32)
+        dist.broadcast(flag, src=0)
+        if int(flag.item()) != 0:
+            if error is not None:
+                raise error
+            raise RuntimeError("rank 0 failed inside rank0_barrier_call")
+    elif error is not None:
+        raise error
+    return result
 
 
 def resolve_compile(device: torch.device, compile_flag: bool | None) -> bool:
@@ -215,7 +254,17 @@ def set_lr(optimizer, lr: float):
 
 
 def level_weights(levels, alpha: float, device=None, dtype=torch.float32):
-    """w_k = ell_k^{-alpha} / sum_j ell_j^{1-alpha} (paper ELBO weighting)."""
+    """w_k = ell_k^{-alpha} / sum_j ell_j^{1-alpha}.
+
+    These weights satisfy sum_k ell_k * w_k = 1, so the generator loss is a
+    weighted mean of per-position cross-entropy.
+
+    alpha=0 is the paper ELBO: every code position has the same weight, and
+    long fine levels dominate because they have more cells. alpha>0 departs
+    from that ELBO and moves mass onto shorter (coarser and mid) levels.
+    The Kaggle config sets alpha=0.5 for that experiment. Other configs keep
+    alpha=0. The value stays configurable; it is not hard-coded in the loss.
+    """
     ell = torch.tensor([float(x) for x in levels], dtype=dtype, device=device)
     denom = ell.pow(1.0 - float(alpha)).sum().clamp(min=1e-12)
     return ell.pow(-float(alpha)) / denom
@@ -224,7 +273,8 @@ def level_weights(levels, alpha: float, device=None, dtype=torch.float32):
 def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0, return_parts=False):
     """Per-position CE, weighted by w_k, sliced to each level's true vocab size.
 
-    When alpha=0 this equals the mean CE over all predicted code positions.
+    When alpha=0 this equals the mean CE over all predicted code positions
+    (the paper ELBO). alpha!=0 is a documented departure; see level_weights.
     logits:  (B, sum(levels), max_vocab)
     targets: (B, sum(levels))  -- clean codes for levels[1:] when level 0 is not predicted
     """
@@ -248,24 +298,57 @@ def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0, 
     return loss
 
 
-def corrupt_codes(idx, levels, vocab_sizes, p_max=0.8, p_min=0.2):
+def corrupt_level_rates(n_levels, p_max=0.8, p_min=0.2):
+    """Per-level input corruption rates, coarse p_max down to fine p_min."""
+    n = int(n_levels)
+    if n <= 0:
+        return []
+    if n == 1:
+        return [float(p_max)]
+    span = float(p_max) - float(p_min)
+    return [float(p_max) - span * k / (n - 1) for k in range(n)]
+
+
+def corrupt_codes(idx, levels, vocab_sizes, p_max=0.8, p_min=0.2, generator=None):
     """Replace a fraction of INPUT codes uniformly from the same level's codebook.
 
     Rate decreases linearly from p_max at level 0 to p_min at the last level
     (mean 0.50 when p_max=0.8, p_min=0.2). Labels are not modified.
+    Pass a torch.Generator to keep a validation pass from changing the train RNG.
     """
     out = idx.clone()
-    K = len(levels)
+    rates = corrupt_level_rates(len(levels), p_max=p_max, p_min=p_min)
     offset = 0
-    for k, (ell, vk) in enumerate(zip(levels, vocab_sizes)):
+    for p, ell, vk in zip(rates, levels, vocab_sizes):
         ell, vk = int(ell), int(vk)
-        p = float(p_max) if K <= 1 else float(p_max) - (float(p_max) - float(p_min)) * k / (K - 1)
         chunk = out[:, offset : offset + ell]
-        mask = torch.rand(chunk.shape, device=idx.device) < p
-        noise = torch.randint(0, vk, chunk.shape, device=idx.device)
+        mask = _rand_like(chunk.shape, idx.device, generator) < p
+        noise = _randint_like(vk, chunk.shape, idx.device, generator)
         out[:, offset : offset + ell] = torch.where(mask, noise, chunk)
         offset += ell
     return out
+
+
+def _generator_device(generator):
+    if generator is None:
+        return None
+    dev = getattr(generator, "device", None)
+    if dev is None:
+        return torch.device("cpu")
+    return dev if isinstance(dev, torch.device) else torch.device(dev)
+
+
+def _rand_like(shape, device, generator):
+    """Draw Uniform(0, 1). A CPU generator still works when `device` is CUDA."""
+    if generator is None or _generator_device(generator).type == torch.device(device).type:
+        return torch.rand(shape, device=device, generator=generator)
+    return torch.rand(shape, generator=generator).to(device)
+
+
+def _randint_like(high, shape, device, generator):
+    if generator is None or _generator_device(generator).type == torch.device(device).type:
+        return torch.randint(0, int(high), shape, device=device, generator=generator)
+    return torch.randint(0, int(high), shape, generator=generator).to(device)
 
 
 def build_prefix_ids(batch_size, eos_id, prefix_len=1, device=None):

@@ -83,7 +83,7 @@ def find_input_artifacts(explicit=None):
 
 def copy_prior(src: Path, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
-    for stage in ("tokenizer", "generator"):
+    for stage in ("tokenizer", "generator", "splitter"):
         s, d = src / stage, dest / stage
         if not s.exists():
             continue
@@ -92,6 +92,9 @@ def copy_prior(src: Path, dest: Path):
             target = d / item.name
             if item.is_file() and not target.exists():
                 shutil.copy2(item, target)
+    cached = src / "packed_windows.pt"
+    if cached.is_file() and not (dest / "packed_windows.pt").exists():
+        shutil.copy2(cached, dest / "packed_windows.pt")
 
 
 def gpu_count(nproc):

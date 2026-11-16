@@ -117,14 +117,18 @@ Kaggle 每週約 30 個 GPU 小時，單場最長 12 小時，T4 × 2 共 32 GiB
 2. notebook 會 clone 本倉庫、安裝 `omegaconf hydra-core datasets regex`（**不要重裝 torch**），然後執行：
 
 ```bash
-python scripts/train_kaggle.py --hours 11.5 --output_dir /kaggle/working/artifacts
+python scripts/train_kaggle.py --hours 11.5 --reserve_minutes 15 \
+    --output_dir /kaggle/working/artifacts --config config/kaggle.yaml \
+    --batch_size 4 --gradient_checkpointing
 ```
 
-3. 編排腳本先訓練 tokenizer，完成後再用剩餘時間訓練 generator。時間到會存 `latest.pt` 並退出。把該場 Output 加成下一場的 Input dataset，再跑一次同一份 notebook 就會自動續訓。
-4. 預設語料是 BookCorpus 開源重建版；若下載失敗，會改用 MiniPile，再不行才用 TinyStories。設定在 `config/kaggle.yaml`（Flex 關閉、每卡 batch 8、每 1000 步存檔）。
-5. 日誌在 `artifacts/tokenizer/tokenizer_log.jsonl` 與 `artifacts/generator/generator_log.jsonl`。`status.json` 的 `finished: true` 代表該階段已跑完設定的 `max_steps`（預設各 10 萬步）。
+3. 編排腳本先看 tokenizer 的 `status.json`。`finished: true` 就跳過，再用剩餘時間訓練 generator。時間到會存 `latest.pt` 並退出。下一場請掛上 **COMPLETE 的 kernel 第 5 版 Output**（tokenizer 已完成、generator step 27595），再跑一次同一份 notebook。
+4. 預設語料是 BookCorpus 開源重建版；若下載失敗，會改用 MiniPile，再不行才用 TinyStories。`config/kaggle.yaml`：Flex 關閉、chunked attention、梯度檢查點、T4 用 fp16、generator 每卡 batch 4、`max_windows: 524288`（約 2.68 億 token，並快取 `artifacts/packed_windows.pt`）、`alpha: 0.5`。`alpha: 0.5` **不是**論文 ELBO（那是 `alpha: 0`，本機 `gpt1.yaml` 仍用 0）；它是為了拉高 v5 裡落後的中層 CE。每 1000 步在 rank 0 對 256 個保留視窗算 val loss 與各層 CE。
+5. 日誌在 `artifacts/tokenizer/tokenizer_log.jsonl` 與 `artifacts/generator/generator_log.jsonl`。舊欄位（`loss`、`ce_first` / `ce_mid` / `ce_last`、`ce`、`acc`）都還在，另外多了 `ce_levels`、`grad_norm`、`data_epoch`、`corrupt_p`，tokenizer 另有 `fine_drop_keep`。`status.json` 的 `finished: true` 代表該階段已跑完設定的 `max_steps`。規則切分器沒有權重，會寫 `artifacts/splitter/status.json`，並照樣按句打包。
 
-雙 T4 + 分層注意力，完整 10 萬 + 10 萬步有機會在約 30 小時內分幾場跑完，但仍取決於實際 steps/s。若顯存不足，把 `--batch_size` 改成 4。
+從 step 27595 續訓時，權重與 optimizer 會從該檢查點載入，但視窗池變大、損失改成 alpha 0.5。中途的 loss 不要和 alpha 0 的舊曲線直接比較。
+
+若 batch 4 仍 OOM，把 `--batch_size` 降到 2。確認 4 放得下之後才試 8；沒有梯度檢查點時 batch 4 曾經 OOM。
 
 多卡本機等價指令：
 

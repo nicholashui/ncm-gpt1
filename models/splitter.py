@@ -52,18 +52,26 @@ def load_boundary_tagger(path, vocab_size, pad_id=0, map_location="cpu"):
 
 
 def maybe_load_splitter_model(cfg, tokenizer, map_location="cpu"):
-    """Return a BoundaryTagger if backend=model and the checkpoint exists."""
+    """Return a BoundaryTagger if backend=model and the checkpoint exists.
+
+    backend=rules is not a silent success: there is no checkpoint to load.
+    Callers that pack or generate should use utils.linguistic.activate_splitter,
+    which logs that and still applies pack_by_sentence / guide_expand.
+    """
     raw = {}
     if cfg is not None:
         try:
             raw = dict(cfg.get("splitter", {}) or {})
         except Exception:
             raw = {}
-    if str(raw.get("backend", "rules")) != "model":
+    backend = str(raw.get("backend", "rules"))
+    if backend != "model":
         return None
     path = Path(str(raw.get("ckpt", "artifacts/splitter/splitter.pt")))
     if not path.is_file():
+        print(f"splitter backend=model checkpoint missing at {path}; rules will be used", flush=True)
         return None
     vocab = int(getattr(tokenizer, "vocab_size", 50257))
     pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    print(f"splitter backend=model loading {path}", flush=True)
     return load_boundary_tagger(path, vocab, pad_id=pad_id, map_location=map_location)
