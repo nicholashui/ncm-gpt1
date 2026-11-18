@@ -17,6 +17,7 @@ from models.common import chunked_block_diagonal_sdpa
 from omegaconf import OmegaConf
 
 from utils.data import (
+    _wait_for_packed_cache,
     acquire_packed_windows,
     corpus_cache_meta,
     pack_documents,
@@ -208,7 +209,113 @@ def test_heldout_and_pack_cache(tmp_path: Path):
     assert not wrote_again
     assert torch.equal(first, second)
     assert n_docs >= 1 and n_toks >= 5
+    # A truncated cache must not be treated as a hit.
+    cache.write_bytes(b"not-a-torch-cache")
+    rebuilt, _, _, wrote_rebuild = acquire_packed_windows(
+        ["ab", "cd"],
+        _PackTok(),
+        4,
+        min_windows=0,
+        repeat=1,
+        respect_sentences=False,
+        max_windows=2,
+        cache_path=cache,
+        cache_meta=meta,
+        rank=0,
+        world_size=1,
+    )
+    assert wrote_rebuild and rebuilt.shape == (2, 4)
+    assert not cache.with_name(cache.name + ".tmp").exists()
     print(f"  PASS  held-out split + pack cache  n_docs={n_docs}")
+
+
+def test_slow_pack_does_not_nccl_barrier(tmp_path: Path):
+    """Peer ranks poll the cache. A slow pack must not post dist.barrier."""
+    import inspect
+    import threading
+    import time
+    import torch.distributed as dist
+
+    src = inspect.getsource(acquire_packed_windows) + "\n" + inspect.getsource(_wait_for_packed_cache)
+    assert "dist.barrier" not in src
+    assert "torch.distributed" not in src
+
+    barriers = []
+    original = dist.barrier
+
+    def boom(*args, **kwargs):
+        barriers.append(1)
+        raise AssertionError("NCCL barrier during pack")
+
+    dist.barrier = boom
+    cache = tmp_path / "slow_packed_windows.pt"
+    if cache.exists():
+        cache.unlink()
+    err = cache.with_name(cache.name + ".error")
+    if err.exists():
+        err.unlink()
+    meta = corpus_cache_meta(
+        type("Args", (), {
+            "hf_dataset": "toy",
+            "hf_split": "train",
+            "hf_text_field": "text",
+            "data": "",
+            "max_docs": None,
+        })(),
+        4, 2, False, 1, 1, 0,
+    )
+    results = {}
+    errors = {}
+
+    def docs():
+        yield "ab"
+        time.sleep(0.4)
+        yield "cd"
+
+    def run(rank, documents):
+        try:
+            results[rank] = acquire_packed_windows(
+                documents,
+                _PackTok(),
+                4,
+                min_windows=0,
+                repeat=1,
+                respect_sentences=False,
+                max_windows=2,
+                cache_path=cache,
+                cache_meta=meta,
+                rank=rank,
+                world_size=2,
+                wait_timeout_s=5,
+                wait_poll_s=0.05,
+                progress_s=0.0,
+            )
+        except Exception as exc:
+            errors[rank] = exc
+
+    import io
+    from contextlib import redirect_stdout
+    log = io.StringIO()
+    try:
+        with redirect_stdout(log):
+            waiter = threading.Thread(target=run, args=(1, ()))
+            waiter.start()
+            time.sleep(0.05)
+            run(0, docs())
+            waiter.join(timeout=5)
+    finally:
+        dist.barrier = original
+    text = log.getvalue()
+    assert "no NCCL barrier" in text, text
+    assert "packing..." in text, text
+    assert "elapsed=" in text, text
+    assert not waiter.is_alive(), "waiter still blocked"
+    assert not errors, errors
+    assert not barriers
+    assert results[0][3] is True and results[1][3] is False
+    assert torch.equal(results[0][0], results[1][0])
+    assert results[0][0].shape == (2, 4)
+    print("  PASS  slow pack waits on file, not NCCL")
 
 
 def test_kaggle_campaign_defaults():
@@ -254,6 +361,7 @@ def main():
         test_pack_max_windows,
         test_level_weights_and_corrupt_rates,
         lambda: test_heldout_and_pack_cache(tmp),
+        lambda: test_slow_pack_does_not_nccl_barrier(tmp),
         test_kaggle_campaign_defaults,
         lambda: test_prune_and_status(tmp),
     ]

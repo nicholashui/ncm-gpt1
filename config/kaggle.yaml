@@ -239,7 +239,9 @@ splitter:
 # (~1 GiB); each rank then holds an int64 tensor (~2 GiB). Two processes
 # stay well under Kaggle's ~29 GiB. The tensor is cached at
 # artifacts/packed_windows.pt so a later resume with the same cap does not
-# pack again. The full BookCorpusOpen stream is not the default: packing
+# pack again. Other DDP ranks poll that file; they do not wait on an NCCL
+# barrier (session v6 hit the 10-minute watchdog while rank 0 was still
+# packing). The full BookCorpusOpen stream is not the default: packing
 # it can spend a large part of a 12h session. Changing this cap on resume
 # from step 27595 is intentional; checkpoints do not store the window order.
 data:

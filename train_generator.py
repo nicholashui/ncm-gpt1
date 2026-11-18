@@ -231,9 +231,8 @@ def main():
         args, L, max_windows, splitter_kw["respect_sentences"], pack_repeat, eos_id, pad_id
     )
     cache_path = Path(args.output_dir).resolve().parent / "packed_windows.pt"
-    if world_size > 1:
-        import torch.distributed as dist
-        dist.barrier()
+    # No NCCL barrier here. Rank 0 may pack for much longer than the default
+    # 10-minute watchdog; other ranks poll packed_windows.pt.
     docs = iter_all_documents(args) if rank == 0 else ()
     try:
         windows, n_docs, n_toks, packed_now = acquire_packed_windows(
