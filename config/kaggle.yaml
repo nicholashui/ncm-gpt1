@@ -1,7 +1,9 @@
 # Kaggle T4 x2 training config (GPT-1-scale NCM, book-like data).
 # Flex Attention is off (Turing / sm_75). Use chunked block-diagonal SDPA instead.
-# Generator default is batch 4 per GPU with gradient checkpointing (effective 8
-# on two T4s). Resume across 12-hour sessions. alpha=0.5 below is NOT the paper ELBO.
+# Generator default is batch 2 per GPU with gradient checkpointing.
+# v7 batch 4 matched v5 batch 2 on tokens/s (~1400) and halved steps/s
+# (0.34 vs 0.69), so the 100k-step budget moves faster at batch 2.
+# alpha=0.5 plus mid_aux below is NOT the paper ELBO.
 # Default corpus is an open BookCorpus recreation (GPT-1's domain); the
 # orchestrator falls back if the Hub dataset is unavailable.
 # GPT-1 scale Next-Concept Model (not a clone of 2018 GPT-1 weights).
@@ -170,11 +172,12 @@ train:
     save_every: 1000
     pack_repeat: 1
   generator:
-    # v5 fit batch 2 with checkpointing (~3.3 GiB of 14.56 GiB). Batch 4
-    # without checkpointing OOM'd on kernel v4. Checkpointing stays on;
-    # default is now 4 per GPU. Try 8 only after a run shows 4 fits.
-    # --batch_size still overrides this.
-    batch_size: 4
+    # v5 batch 2 + checkpointing: ~0.69 steps/s, ~1406 tok/s, ~3.27 GiB.
+    # v7 batch 4 + checkpointing: ~0.34 steps/s, ~1403 tok/s, ~4.06 GiB, no OOM.
+    # Tokens/s did not rise, so batch 4 only spends twice the wall time per
+    # optimizer step. Default is 2 per GPU again so the 100k-step budget
+    # finishes in fewer hours. Checkpointing stays on. --batch_size overrides.
+    batch_size: 2
     peak_lr: 3.0e-4
     floor_lr: 3.0e-5
     warmup: 500
@@ -183,12 +186,15 @@ train:
     grad_clip: 1.0
     max_steps: 100000
     save_every: 1000
-    # DEPARTS FROM THE PAPER ELBO. alpha=0 weights every code position
-    # equally, so the 512-cell level dominates and mid/coarse CE lagged in
-    # v5 (~26% improvement vs ~77% on the finest level). alpha=0.5 shifts
-    # weight onto shorter levels. gpt1.yaml / smoke.yaml stay at 0.
-    # Resuming step 27595 with this value changes the loss mid-run.
+    # DEPARTS FROM THE PAPER ELBO (alpha=0, every code position equal).
+    # alpha=0.5 is what v7/v8 trained. It moved ce_first (~5.17 to ~4.54)
+    # and barely moved the central band (ce around 5.2–6.1 on lengths 81–225
+    # versus ~1.5 on the 512-cell level). mid_aux adds that band's mean CE.
+    # gpt1.yaml / smoke.yaml stay at alpha 0 and mid_aux 0.
+    # The scalar loss is NOT comparable to v5 (alpha 0) or to v7/v8
+    # (alpha 0.5, mid_aux 0). Compare ce_levels / ce_first / ce_mid / ce_last.
     alpha: 0.5
+    mid_aux: 0.5
     corrupt_p_max: 0.8    # linearly decreasing corruption, mean rate 0.50
     corrupt_p_min: 0.2
     pack_repeat: 1

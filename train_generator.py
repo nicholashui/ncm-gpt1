@@ -52,6 +52,7 @@ from utils.train_utils import (
     cuda_mem_gb,
     dist_print,
     generator_ce_loss,
+    mid_level_slice,
     init_distributed,
     is_main_process,
     load_module_state,
@@ -121,6 +122,7 @@ def _generator_val_metrics(
     prefix_len,
     raw_prefix,
     batch_size,
+    mid_aux=0.0,
 ):
     """Forward-only held-out CE. Uses a private RNG so training noise is unchanged."""
     if val_windows is None or val_windows.shape[0] == 0:
@@ -152,7 +154,8 @@ def _generator_val_metrics(
             targets = idx[:, levels[0]:]
             logits = model(x)
             loss, parts = generator_ce_loss(
-                logits, targets, target_levels, target_vocabs, alpha=alpha, return_parts=True
+                logits, targets, target_levels, target_vocabs,
+                alpha=alpha, mid_aux=mid_aux, return_parts=True,
             )
             total_loss += float(loss.detach()) * B
             if total_ce is None:
@@ -206,6 +209,7 @@ def main():
     wd = float(gcfg.weight_decay)
     clip = float(gcfg.grad_clip)
     alpha = float(gcfg.get("alpha", 0.0))
+    mid_aux = float(gcfg.get("mid_aux", 0.0) or 0.0)
     p_max = float(gcfg.get("corrupt_p_max", 0.8))
     p_min = float(gcfg.get("corrupt_p_min", 0.2))
     pack_repeat = int(gcfg.get("pack_repeat", 1))
@@ -258,12 +262,13 @@ def main():
         f"(train={len(train_windows)} val={len(val_windows)} cap={max_windows} "
         f"cache={'wrote' if packed_now else 'hit'} {cache_path})"
     )
-    if alpha == 0.0:
-        dist_print("generator alpha=0 (paper ELBO: equal weight per code position)")
+    if alpha == 0.0 and mid_aux == 0.0:
+        dist_print("generator alpha=0 mid_aux=0 (paper ELBO: equal weight per code position)")
     else:
         dist_print(
-            f"generator alpha={alpha} departs from the paper ELBO (alpha=0); "
-            "shorter mid/coarse levels get more of the loss"
+            f"generator alpha={alpha} mid_aux={mid_aux} departs from the paper ELBO "
+            "(alpha=0, mid_aux=0). Do not compare this total loss to v5 (alpha 0) "
+            "or to v7/v8 (alpha 0.5, mid_aux 0). Per-level CE is still comparable."
         )
     loader, sampler = make_loader(
         train_windows,
@@ -288,6 +293,11 @@ def main():
     target_levels = levels[1:]
     target_vocabs = vocab_sizes[1:]
     corrupt_rates = corrupt_level_rates(len(levels), p_max=p_max, p_min=p_min)
+    mid_lo, mid_hi = mid_level_slice(len(target_levels))
+    dist_print(
+        f"mid_aux={mid_aux} on predicted levels [{mid_lo}:{mid_hi}) "
+        f"of {len(target_levels)}"
+    )
     if corrupt_rates:
         dist_print(
             "corrupt_p first/mid/last="
@@ -415,7 +425,8 @@ def main():
                         f"(predict_level0 / query_level0 should be false)"
                     )
                 loss, level_ce = generator_ce_loss(
-                    logits, targets, target_levels, target_vocabs, alpha=alpha, return_parts=True
+                    logits, targets, target_levels, target_vocabs,
+                    alpha=alpha, mid_aux=mid_aux, return_parts=True,
                 )
 
             grad_norm = optimize(loss, opt, net.parameters(), clip, scaler)
@@ -450,6 +461,7 @@ def main():
                         prefix_len,
                         raw_prefix,
                         val_batch,
+                        mid_aux,
                     )
                 val_metrics = rank0_barrier_call(_run_val)
 
@@ -503,6 +515,7 @@ def main():
                     "n_windows": int(train_windows.shape[0]),
                     "n_val_windows": int(val_windows.shape[0]),
                     "alpha": alpha,
+                    "mid_aux": mid_aux,
                     "corrupt_p": [round(float(p), 6) for p in corrupt_rates],
                     "corrupt_p_first": cp0,
                     "corrupt_p_mid": cpm,

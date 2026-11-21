@@ -28,7 +28,9 @@ from utils.train_utils import (
     ThroughputMeter,
     corrupt_codes,
     corrupt_level_rates,
+    generator_ce_loss,
     level_weights,
+    mid_level_slice,
     load_module_state,
     module_state_dict,
     prune_checkpoints,
@@ -320,8 +322,9 @@ def test_slow_pack_does_not_nccl_barrier(tmp_path: Path):
 
 def test_kaggle_campaign_defaults():
     cfg = OmegaConf.load(ROOT / "config/kaggle.yaml")
-    assert int(cfg.train.generator.batch_size) == 4
+    assert int(cfg.train.generator.batch_size) == 2
     assert float(cfg.train.generator.alpha) == 0.5
+    assert float(cfg.train.generator.mid_aux) == 0.5
     assert bool(cfg.model.gradient_checkpointing) is True
     assert bool(cfg.model.use_chunked_block_attn) is True
     assert bool(cfg.model.use_flex_attention) is False
@@ -333,7 +336,41 @@ def test_kaggle_campaign_defaults():
     # Local configs stay on the paper ELBO.
     gpt1 = OmegaConf.load(ROOT / "config/gpt1.yaml")
     assert float(gpt1.train.generator.alpha) == 0.0
-    print("  PASS  kaggle defaults (batch 4, alpha 0.5, cap 524288, T4 safety flags)")
+    print("  PASS  kaggle defaults (batch 2, alpha 0.5, mid_aux 0.5, cap 524288)")
+
+
+def test_mid_aux_central_third():
+    assert mid_level_slice(22) == (7, 14)
+    assert mid_level_slice(1) == (0, 1)
+    torch.manual_seed(0)
+    levels = [4, 9, 16, 25, 36, 49]
+    vocabs = [8] * len(levels)
+    span = sum(levels)
+    logits = torch.randn(2, span, 8, requires_grad=True)
+    targets = torch.randint(0, 8, (2, span))
+    loss0, parts = generator_ce_loss(
+        logits, targets, levels, vocabs, alpha=0.5, mid_aux=0.0, return_parts=True
+    )
+    loss1, parts1 = generator_ce_loss(
+        logits, targets, levels, vocabs, alpha=0.5, mid_aux=0.5, return_parts=True
+    )
+    assert parts == parts1
+    start, end = mid_level_slice(len(parts))
+    mid_mean = sum(parts[start:end]) / (end - start)
+    assert abs(float(loss1.detach()) - float(loss0.detach()) - 0.5 * mid_mean) < 1e-5
+    loss0.backward(retain_graph=True)
+    grad0 = logits.grad.detach().abs().clone()
+    logits.grad = None
+    loss1.backward()
+    grad1 = logits.grad.detach().abs()
+    offset = sum(levels[:start])
+    mid_w = sum(levels[start:end])
+    # The auxiliary term increases gradient on the central-third positions.
+    assert float(grad1[:, offset:offset + mid_w].sum()) > float(grad0[:, offset:offset + mid_w].sum())
+    print(
+        f"  PASS  mid_aux central third [{start}:{end})  "
+        f"delta={float((loss1 - loss0).detach()):.4f}"
+    )
 
 
 def test_prune_and_status(tmp_path: Path):
@@ -363,6 +400,7 @@ def main():
         lambda: test_heldout_and_pack_cache(tmp),
         lambda: test_slow_pack_does_not_nccl_barrier(tmp),
         test_kaggle_campaign_defaults,
+        test_mid_aux_central_third,
         lambda: test_prune_and_status(tmp),
     ]
     failed = 0

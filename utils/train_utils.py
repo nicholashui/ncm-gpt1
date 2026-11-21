@@ -261,20 +261,55 @@ def level_weights(levels, alpha: float, device=None, dtype=torch.float32):
 
     alpha=0 is the paper ELBO: every code position has the same weight, and
     long fine levels dominate because they have more cells. alpha>0 departs
-    from that ELBO and moves mass onto shorter (coarser and mid) levels.
-    The Kaggle config sets alpha=0.5 for that experiment. Other configs keep
-    alpha=0. The value stays configurable; it is not hard-coded in the loss.
+    from that ELBO and moves mass onto shorter levels. On the 22 predicted
+    Kaggle levels, alpha=0.5 still leaves the central third (the high-CE
+    band) with about the same share as alpha=0; further alpha mostly feeds
+    the shortest levels. That central band is handled by mid_aux in
+    generator_ce_loss. Other configs keep alpha=0. The value stays
+    configurable; it is not hard-coded in the loss.
     """
     ell = torch.tensor([float(x) for x in levels], dtype=dtype, device=device)
     denom = ell.pow(1.0 - float(alpha)).sum().clamp(min=1e-12)
     return ell.pow(-float(alpha)) / denom
 
 
-def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0, return_parts=False):
+def mid_level_slice(n_levels: int) -> tuple[int, int]:
+    """Half-open index range of the central third of predicted levels.
+
+    For the 22 Kaggle predicted lengths this is indices [7, 14): lengths
+    81 through 225. Official v7 (alpha=0.5) median CE on that band was about
+    5.2–6.1, against about 4.5 on the shortest predicted level and 1.5 on
+    the 512-cell level. Raising alpha further does not aim at this band.
+    """
+    n = int(n_levels)
+    if n <= 0:
+        return 0, 0
+    if n < 3:
+        return 0, n
+    start = n // 3
+    end = (2 * n) // 3
+    if end <= start:
+        end = min(n, start + 1)
+    return start, end
+
+
+def generator_ce_loss(
+    logits,
+    targets,
+    levels,
+    vocab_sizes,
+    alpha: float = 0.0,
+    mid_aux: float = 0.0,
+    return_parts=False,
+):
     """Per-position CE, weighted by w_k, sliced to each level's true vocab size.
 
-    When alpha=0 this equals the mean CE over all predicted code positions
-    (the paper ELBO). alpha!=0 is a documented departure; see level_weights.
+    When alpha=0 and mid_aux=0 this equals the mean CE over all predicted
+    code positions (the paper ELBO). alpha!=0 is a documented departure; see
+    level_weights. mid_aux>0 adds mid_aux times the mean of the central-third
+    level CEs. That term changes the scalar loss, so a run with mid_aux must
+    not be compared to alpha-only curves (v5 alpha=0, v7/v8 alpha=0.5).
+    Per-level CE parts stay the raw means either way.
     logits:  (B, sum(levels), max_vocab)
     targets: (B, sum(levels))  -- clean codes for levels[1:] when level 0 is not predicted
     """
@@ -283,6 +318,7 @@ def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0, 
     w = level_weights(levels, alpha, device=device, dtype=torch.float32)
     total = logits.new_zeros(())
     parts = []
+    level_means = []
     offset = 0
     for k, (ell, vk) in enumerate(zip(levels, vocab_sizes)):
         ell, vk = int(ell), int(vk)
@@ -290,9 +326,16 @@ def generator_ce_loss(logits, targets, levels, vocab_sizes, alpha: float = 0.0, 
         tg = targets[:, offset : offset + ell].reshape(-1)
         ce = F.cross_entropy(lg, tg, reduction="none")
         total = total + (ce * w[k]).sum()
-        parts.append(float(ce.mean().detach()))
+        level_means.append(ce.mean())
+        parts.append(float(level_means[-1].detach()))
         offset += ell
     loss = total / B
+    coef = float(mid_aux or 0.0)
+    if coef != 0.0 and level_means:
+        start, end = mid_level_slice(len(level_means))
+        if end > start:
+            mid_mean = torch.stack(level_means[start:end]).mean()
+            loss = loss + coef * mid_mean
     if return_parts:
         return loss, parts
     return loss
