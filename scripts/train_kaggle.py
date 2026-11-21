@@ -51,6 +51,8 @@ def parse_args():
     p.add_argument("--no_compile", action="store_true", default=True,
                    help="leave torch.compile off (safer on T4 + DDP; default)")
     p.add_argument("--compile", action="store_true", help="enable torch.compile")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="recompute generator blocks to fit T4 memory")
     return p.parse_args()
 
 
@@ -81,7 +83,7 @@ def find_input_artifacts(explicit=None):
 
 def copy_prior(src: Path, dest: Path):
     dest.mkdir(parents=True, exist_ok=True)
-    for stage in ("tokenizer", "generator"):
+    for stage in ("tokenizer", "generator", "splitter"):
         s, d = src / stage, dest / stage
         if not s.exists():
             continue
@@ -90,6 +92,9 @@ def copy_prior(src: Path, dest: Path):
             target = d / item.name
             if item.is_file() and not target.exists():
                 shutil.copy2(item, target)
+    cached = src / "packed_windows.pt"
+    if cached.is_file() and not (dest / "packed_windows.pt").exists():
+        shutil.copy2(cached, dest / "packed_windows.pt")
 
 
 def gpu_count(nproc):
@@ -130,6 +135,8 @@ def launch(stage, args, out_dir: Path, hours: float, extra: list[str]):
     ]
     if args.batch_size:
         cmd += ["--batch_size", str(args.batch_size)]
+    if args.gradient_checkpointing and stage == "generator":
+        cmd += ["--gradient_checkpointing"]
     if args.max_windows:
         cmd += ["--max_windows", str(args.max_windows)]
     if args.max_docs:

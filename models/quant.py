@@ -268,6 +268,10 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
         self.fine_drop_prob_start = float(_ps) if _ps is not None else None
         self.fine_drop_anneal_steps = int(_cfg_get(_fd, 'anneal_steps', 0) or 0)
         self.register_buffer('_fd_step', torch.zeros((), dtype=torch.long), persistent=False)
+        # Last forward's nested-dropout depth (levels kept). Full depth when it did not fire.
+        self.last_fine_drop_prob = float(self.fine_drop_prob)
+        self.last_fine_drop_keep = 0
+        self.last_fine_drop_applied = False
         _ss = spatial_skip if spatial_skip is not None else _cfg_get(aux, 'spatial_skip', None)
         self.spatial_skip_enabled = bool(_cfg_get(_ss, 'enabled', False))
         self.spatial_skip_min_level = int(_cfg_get(_ss, 'min_level', 8))
@@ -561,12 +565,18 @@ class MultiscaleResidualVectorQuantizer(VectorQuantizerBaseClass):
             getattr(self, f'codebook_hit_{i}')[indices.view(B * level)] = 1
 
         vq_loss = vq_loss / num_levels
+        self.last_fine_drop_prob = float(_fd_p)
+        self.last_fine_drop_applied = False
+        self.last_fine_drop_keep = int(num_levels)
         if do_fine_drop and len(z_hat_keep) >= 2:
             kmin = max(self.fine_drop_min_keep - 1, 0)
             kmax = len(z_hat_keep) - 2
             if kmax >= kmin:
                 K = int(torch.randint(kmin, kmax + 1, ()))
                 z_hat = z_hat_keep[K]
+                # z_hat_keep[K] is the reconstruction through level K (0-based).
+                self.last_fine_drop_keep = int(K + 1)
+                self.last_fine_drop_applied = True
         z_hat = z + (z_hat - z).detach()
 
         per_level_codebook_utilization = [
