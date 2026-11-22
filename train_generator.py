@@ -26,8 +26,15 @@ import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from utils.linguistic import pack_kwargs_from_cfg
-from utils.data import infinite_loader, iter_all_documents, make_loader, pack_documents
+from utils.linguistic import activate_splitter
+from utils.data import (
+    acquire_packed_windows,
+    corpus_cache_meta,
+    infinite_loader,
+    iter_all_documents,
+    make_loader,
+    split_heldout_windows,
+)
 from utils.train_utils import (
     TimeBudget,
     ThroughputMeter,
@@ -41,9 +48,11 @@ from utils.train_utils import (
     cleanup_distributed,
     configure_cuda,
     corrupt_codes,
+    corrupt_level_rates,
     cuda_mem_gb,
     dist_print,
     generator_ce_loss,
+    mid_level_slice,
     init_distributed,
     is_main_process,
     load_module_state,
@@ -56,12 +65,14 @@ from utils.train_utils import (
     param_counts,
     prefix_latents,
     prune_checkpoints,
+    rank0_barrier_call,
     resolve_compile,
     resolve_resume,
     save_checkpoint,
     set_lr,
     set_seed,
     setup_amp,
+    unwrap_model,
     wrap_ddp,
     write_run_status,
 )
@@ -80,6 +91,8 @@ def parse_args():
     p.add_argument("--max_steps", type=int, default=None)
     p.add_argument("--save_every", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="recompute each transformer block during backward (saves VRAM)")
     p.add_argument("--resume", default=None, help="checkpoint path, or 'auto' to use output_dir/latest.pt")
     add_device_args(p)
     p.add_argument("--seed", type=int, default=None)
@@ -90,6 +103,79 @@ def parse_args():
 def _cfg_data(cfg, key, default=None):
     data = cfg.get("data", {}) or {}
     return data.get(key, default) if hasattr(data, "get") else default
+
+
+@torch.no_grad()
+def _generator_val_metrics(
+    net,
+    vqvae,
+    val_windows,
+    device,
+    levels,
+    vocab_sizes,
+    target_levels,
+    target_vocabs,
+    alpha,
+    p_max,
+    p_min,
+    eos_id,
+    prefix_len,
+    raw_prefix,
+    batch_size,
+    mid_aux=0.0,
+):
+    """Forward-only held-out CE. Uses a private RNG so training noise is unchanged."""
+    if val_windows is None or val_windows.shape[0] == 0:
+        return None
+    model = unwrap_model(net)
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_ce = None
+    n = 0
+    # Fixed generator so val corruption does not draw from the training RNG.
+    # CPU generator: val must not draw from the training RNG, and a CUDA
+    # generator is unnecessary for a few hundred held-out rows.
+    rng = torch.Generator(device="cpu")
+    rng.manual_seed(0)
+    bs = max(int(batch_size), 1)
+    try:
+        for start in range(0, val_windows.shape[0], bs):
+            tokens = val_windows[start:start + bs].to(device)
+            B = tokens.shape[0]
+            idx = vqvae.encode(tokens)
+            corrupted = corrupt_codes(
+                idx, levels, vocab_sizes, p_max=p_max, p_min=p_min, generator=rng
+            )
+            ncm_x = vqvae.vq.idx_to_ncm_input(corrupted)
+            prefix_ids = build_prefix_ids(B, eos_id, prefix_len=prefix_len, device=device)
+            z_prefix = prefix_latents(vqvae, prefix_ids, raw_prefix)
+            x = torch.cat([z_prefix, ncm_x], dim=1)
+            targets = idx[:, levels[0]:]
+            logits = model(x)
+            loss, parts = generator_ce_loss(
+                logits, targets, target_levels, target_vocabs,
+                alpha=alpha, mid_aux=mid_aux, return_parts=True,
+            )
+            total_loss += float(loss.detach()) * B
+            if total_ce is None:
+                total_ce = [0.0] * len(parts)
+            for i, part in enumerate(parts):
+                total_ce[i] += float(part) * B
+            n += B
+    finally:
+        model.train(was_training)
+    if n <= 0 or not total_ce:
+        return None
+    ce = [c / n for c in total_ce]
+    return {
+        "val_loss": total_loss / n,
+        "val_ce_first": ce[0],
+        "val_ce_mid": ce[len(ce) // 2],
+        "val_ce_last": ce[-1],
+        "val_ce_levels": [round(c, 6) for c in ce],
+        "val_tokens": int(n),
+    }
 
 
 def main():
@@ -112,6 +198,8 @@ def main():
 
     gcfg = cfg.train.generator
     batch_size = int(args.batch_size or gcfg.batch_size)
+    if args.gradient_checkpointing:
+        cfg.model.gradient_checkpointing = True
     max_steps = int(args.max_steps or gcfg.max_steps)
     save_every = int(args.save_every or gcfg.get("save_every", max_steps))
     warmup = int(gcfg.warmup)
@@ -121,9 +209,13 @@ def main():
     wd = float(gcfg.weight_decay)
     clip = float(gcfg.grad_clip)
     alpha = float(gcfg.get("alpha", 0.0))
+    mid_aux = float(gcfg.get("mid_aux", 0.0) or 0.0)
     p_max = float(gcfg.get("corrupt_p_max", 0.8))
     p_min = float(gcfg.get("corrupt_p_min", 0.2))
     pack_repeat = int(gcfg.get("pack_repeat", 1))
+    val_every = int(gcfg.get("val_every", 0) or 0)
+    val_windows_n = int(gcfg.get("val_windows", 0) or 0)
+    val_batch = int(gcfg.get("val_batch_size", 1) or 1)
     raw_prefix = bool(cfg.model.get("raw_token_prefix", True))
     prefix_len = int(cfg.model.prefix_len)
 
@@ -135,26 +227,51 @@ def main():
     if world_size > 1:
         dist_print(f"ddp world_size={world_size}  batch_size={batch_size} per GPU")
 
-    pack_kw = pack_kwargs_from_cfg(cfg)
+    splitter_kw = activate_splitter(cfg, args.output_dir, pre_tok)
     max_windows = args.max_windows if args.max_windows is not None else _cfg_data(cfg, "max_windows")
-    if max_windows:
-        pack_kw["max_windows"] = int(max_windows)
+    max_windows = int(max_windows or 0)
     L = int(cfg.tokenizer.vqvae.context_length)
-    if world_size > 1:
-        import torch.distributed as dist
-        dist.barrier()
-    docs = iter_all_documents(args)
+    cache_meta = corpus_cache_meta(
+        args, L, max_windows, splitter_kw["respect_sentences"], pack_repeat, eos_id, pad_id
+    )
+    cache_path = Path(args.output_dir).resolve().parent / "packed_windows.pt"
+    # No NCCL barrier here. Rank 0 may pack for much longer than the default
+    # 10-minute watchdog; other ranks poll packed_windows.pt.
+    docs = iter_all_documents(args) if rank == 0 else ()
     try:
-        windows, n_docs, n_toks = pack_documents(
-            docs, pre_tok, L, min_windows=batch_size * world_size, repeat=pack_repeat, **pack_kw
+        windows, n_docs, n_toks, packed_now = acquire_packed_windows(
+            docs,
+            pre_tok,
+            L,
+            min_windows=batch_size * world_size,
+            repeat=pack_repeat,
+            respect_sentences=splitter_kw["respect_sentences"],
+            max_windows=max_windows,
+            cache_path=cache_path,
+            cache_meta=cache_meta,
+            rank=rank,
+            world_size=world_size,
         )
     except ValueError as exc:
         raise SystemExit(f"provide --data and/or --hf_dataset ({exc})") from exc
-    if pack_kw.get("respect_sentences"):
-        dist_print("packing windows at sentence boundaries")
-    dist_print(f"packed {n_docs} docs / {n_toks} tokens -> {len(windows)} windows of L={L}")
+    train_windows, val_windows = split_heldout_windows(
+        windows, val_windows_n if val_every > 0 else 0, min_train=batch_size * world_size
+    )
+    dist_print(
+        f"packed {n_docs} docs / {n_toks} tokens -> {len(windows)} windows of L={L} "
+        f"(train={len(train_windows)} val={len(val_windows)} cap={max_windows} "
+        f"cache={'wrote' if packed_now else 'hit'} {cache_path})"
+    )
+    if alpha == 0.0 and mid_aux == 0.0:
+        dist_print("generator alpha=0 mid_aux=0 (paper ELBO: equal weight per code position)")
+    else:
+        dist_print(
+            f"generator alpha={alpha} mid_aux={mid_aux} departs from the paper ELBO "
+            "(alpha=0, mid_aux=0). Do not compare this total loss to v5 (alpha 0) "
+            "or to v7/v8 (alpha 0.5, mid_aux 0). Per-level CE is still comparable."
+        )
     loader, sampler = make_loader(
-        windows,
+        train_windows,
         batch_size=batch_size,
         seed=seed,
         pin_memory=pin,
@@ -175,6 +292,17 @@ def main():
     v0 = int(vocab_sizes[0])
     target_levels = levels[1:]
     target_vocabs = vocab_sizes[1:]
+    corrupt_rates = corrupt_level_rates(len(levels), p_max=p_max, p_min=p_min)
+    mid_lo, mid_hi = mid_level_slice(len(target_levels))
+    dist_print(
+        f"mid_aux={mid_aux} on predicted levels [{mid_lo}:{mid_hi}) "
+        f"of {len(target_levels)}"
+    )
+    if corrupt_rates:
+        dist_print(
+            "corrupt_p first/mid/last="
+            f"{corrupt_rates[0]:.3f}/{corrupt_rates[len(corrupt_rates)//2]:.3f}/{corrupt_rates[-1]:.3f}"
+        )
 
     opt = torch.optim.AdamW(
         (p for p in net.parameters() if p.requires_grad),
@@ -205,7 +333,10 @@ def main():
     autocast, scaler, amp_dtype = setup_amp(device, args.amp)
     if scaler is not None and scaler_state is not None:
         scaler.load_state_dict(scaler_state)
-    dist_print(f"amp={amp_dtype}  compile={use_compile}  device={device}")
+    dist_print(
+        f"amp={amp_dtype}  compile={use_compile}  device={device}"
+        f"  checkpoint={bool(getattr(cfg.model, 'gradient_checkpointing', False))}"
+    )
 
     out_dir = Path(args.output_dir)
     if is_main_process():
@@ -294,41 +425,105 @@ def main():
                         f"(predict_level0 / query_level0 should be false)"
                     )
                 loss, level_ce = generator_ce_loss(
-                    logits, targets, target_levels, target_vocabs, alpha=alpha, return_parts=True
+                    logits, targets, target_levels, target_vocabs,
+                    alpha=alpha, mid_aux=mid_aux, return_parts=True,
                 )
 
-            optimize(loss, opt, net.parameters(), clip, scaler)
+            grad_norm = optimize(loss, opt, net.parameters(), clip, scaler)
             meter.update(tokens.numel())
 
-            if (step + 1) % args.log_every == 0 or step == start_step:
+            do_log = (step + 1) % args.log_every == 0 or step == start_step
+            do_val = (
+                val_every > 0
+                and val_windows.shape[0] > 0
+                and (step + 1) % val_every == 0
+            )
+            # Sample the training rate before the held-out pass so val time
+            # does not show up as a drop in steps/s.
+            if do_log or do_val:
                 steps_s, toks_s = meter.rate()
+            val_metrics = None
+            if do_val:
+                def _run_val():
+                    return _generator_val_metrics(
+                        net,
+                        vqvae,
+                        val_windows,
+                        device,
+                        levels,
+                        vocab_sizes,
+                        target_levels,
+                        target_vocabs,
+                        alpha,
+                        p_max,
+                        p_min,
+                        eos_id,
+                        prefix_len,
+                        raw_prefix,
+                        val_batch,
+                        mid_aux,
+                    )
+                val_metrics = rank0_barrier_call(_run_val)
+
+            if do_log or do_val:
                 toks_s = all_reduce_sum(toks_s, device)
                 mem = cuda_mem_gb()
                 ce_first = level_ce[0] if level_ce else float("nan")
                 ce_mid = level_ce[len(level_ce) // 2] if level_ce else float("nan")
                 ce_last = level_ce[-1] if level_ce else float("nan")
+                n_train = max(int(train_windows.shape[0]), 1)
+                data_epoch = (step + 1) * batch_size * world_size / n_train
+                cp0 = round(float(corrupt_rates[0]), 6) if corrupt_rates else float("nan")
+                cpm = round(float(corrupt_rates[len(corrupt_rates) // 2]), 6) if corrupt_rates else float("nan")
+                cp1 = round(float(corrupt_rates[-1]), 6) if corrupt_rates else float("nan")
+                val_note = ""
+                if val_metrics:
+                    val_note = (
+                        f"  val={val_metrics['val_loss']:.4f}"
+                        f" val_ce[first/mid/last]="
+                        f"{val_metrics['val_ce_first']:.4f}/"
+                        f"{val_metrics['val_ce_mid']:.4f}/"
+                        f"{val_metrics['val_ce_last']:.4f}"
+                    )
                 last_log = (
                     f"step {step + 1}/{max_steps}  loss={loss.item():.4f}  "
                     f"ce[first/mid/last]={ce_first:.4f}/{ce_mid:.4f}/{ce_last:.4f}  "
-                    f"lr={lr:.2e}  {steps_s:.2f} steps/s  {toks_s:.0f} tok/s  mem={mem:.2f}GiB"
+                    f"lr={lr:.2e}  {steps_s:.2f} steps/s  {toks_s:.0f} tok/s  mem={mem:.2f}GiB  "
+                    f"grad={grad_norm:.3f}  epoch={data_epoch:.3f}  "
+                    f"corrupt_p[first/mid/last]={cp0:.2f}/{cpm:.2f}/{cp1:.2f}"
+                    f"{val_note}"
                 )
                 pbar.set_postfix(loss=f"{loss.item():.3f}", sps=f"{steps_s:.2f}", tps=f"{toks_s:.0f}")
                 dist_print(last_log, flush=True)
-                logger.log(
-                    stage="generator",
-                    step=step + 1,
-                    max_steps=max_steps,
-                    loss=float(loss.item()),
-                    ce_first=ce_first,
-                    ce_mid=ce_mid,
-                    ce_last=ce_last,
-                    lr=lr,
-                    steps_per_s=steps_s,
-                    tokens_per_s=toks_s,
-                    mem_gb=mem,
-                    hours=budget.elapsed_hours(),
-                    seq_len=int(x.shape[1]),
-                )
+                rec = {
+                    "stage": "generator",
+                    "step": step + 1,
+                    "max_steps": max_steps,
+                    "loss": float(loss.item()),
+                    "ce_first": ce_first,
+                    "ce_mid": ce_mid,
+                    "ce_last": ce_last,
+                    "ce_levels": [round(float(v), 6) for v in level_ce],
+                    "lr": lr,
+                    "steps_per_s": steps_s,
+                    "tokens_per_s": toks_s,
+                    "mem_gb": mem,
+                    "hours": budget.elapsed_hours(),
+                    "seq_len": int(x.shape[1]),
+                    "grad_norm": grad_norm,
+                    "data_epoch": data_epoch,
+                    "n_windows": int(train_windows.shape[0]),
+                    "n_val_windows": int(val_windows.shape[0]),
+                    "alpha": alpha,
+                    "mid_aux": mid_aux,
+                    "corrupt_p": [round(float(p), 6) for p in corrupt_rates],
+                    "corrupt_p_first": cp0,
+                    "corrupt_p_mid": cpm,
+                    "corrupt_p_last": cp1,
+                }
+                if val_metrics:
+                    rec.update(val_metrics)
+                logger.log(**rec)
                 meter.reset()
             if save_every > 0 and (step + 1) % save_every == 0:
                 inference = unigram_payload()

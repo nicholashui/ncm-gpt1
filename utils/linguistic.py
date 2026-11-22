@@ -434,3 +434,107 @@ def pack_kwargs_from_cfg(cfg) -> dict:
             raw = {}
     sc = default_splitter_cfg(raw)
     return {"respect_sentences": bool(sc["enabled"] and sc["pack_by_sentence"])}
+
+
+def _splitter_raw(cfg) -> dict:
+    raw = {}
+    if cfg is None:
+        return raw
+    try:
+        got = cfg.get("splitter", {}) or {}
+        raw = dict(got)
+    except Exception:
+        raw = {}
+    return raw
+
+
+def _env_rank0() -> bool:
+    import os
+    return os.environ.get("RANK", "0") in ("0", "")
+
+
+def activate_splitter(cfg, stage_output_dir, pre_tokenizer=None) -> dict:
+    """Turn the configured splitter on and leave a record under artifacts/splitter.
+
+    The Kaggle config uses backend=rules. That backend has no learned weights,
+    so a previous run wrote no artifacts/splitter/ tree and looked like a
+    no-op. Sentence packing still has to run, and guide_expand still has to
+    be recorded for generation. A model backend loads and copies its
+    checkpoint; a missing file is logged and falls back to the same rules.
+    """
+    import json
+    import shutil
+    from pathlib import Path
+
+    sc = default_splitter_cfg(_splitter_raw(cfg))
+    dest = Path(stage_output_dir).resolve().parent / "splitter"
+    pack = bool(sc["enabled"] and sc["pack_by_sentence"])
+    guide = bool(sc["enabled"] and sc["guide_expand"])
+    status = {
+        "enabled": bool(sc["enabled"]),
+        "backend": sc["backend"],
+        "pack_by_sentence": pack,
+        "guide_expand": guide,
+        "unit": sc["unit"],
+        "weights": False,
+        "ckpt": str(sc["ckpt"]),
+    }
+    messages = []
+    if not sc["enabled"]:
+        messages.append("splitter disabled; pack_by_sentence and guide_expand are off")
+    elif sc["backend"] == "rules":
+        messages.append(
+            "splitter backend=rules has no learned weights; "
+            f"applying pack_by_sentence={pack} and guide_expand={guide} "
+            "(rules are not a no-op)"
+        )
+    elif sc["backend"] == "model":
+        src = Path(str(sc["ckpt"]))
+        if not src.is_file():
+            status["fallback"] = "rules"
+            messages.append(
+                f"splitter backend=model checkpoint missing at {src}; "
+                f"falling back to rules and still applying pack_by_sentence={pack} "
+                f"guide_expand={guide}"
+            )
+        else:
+            try:
+                from models.splitter import load_boundary_tagger
+                vocab = int(getattr(pre_tokenizer, "vocab_size", 50257) or 50257)
+                pad_id = int(getattr(pre_tokenizer, "pad_token_id", 0) or 0)
+                tagger = load_boundary_tagger(src, vocab, pad_id=pad_id)
+                status["weights"] = True
+                status["loaded_ckpt"] = str(src.resolve())
+                status["n_params"] = int(sum(p.numel() for p in tagger.parameters()))
+                del tagger
+                if _env_rank0():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    target = dest / "splitter.pt"
+                    if src.resolve() != target.resolve():
+                        shutil.copy2(src, target)
+                    status["saved_ckpt"] = str(target)
+                messages.append(
+                    f"splitter backend=model loaded {status['n_params']} parameters from {src}; "
+                    f"pack_by_sentence={pack} guide_expand={guide}"
+                )
+            except Exception as exc:
+                status["weights"] = False
+                status["fallback"] = "rules"
+                status["error"] = repr(exc)
+                messages.append(
+                    f"splitter backend=model failed to load {src} ({exc!r}); "
+                    f"falling back to rules and still applying pack_by_sentence={pack} "
+                    f"guide_expand={guide}"
+                )
+    else:
+        status["fallback"] = "rules"
+        messages.append(
+            f"splitter backend={sc['backend']!r} is unknown; "
+            f"using rules with pack_by_sentence={pack} guide_expand={guide}"
+        )
+    if _env_rank0():
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "status.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
+        for line in messages:
+            print(line, flush=True)
+    return {"respect_sentences": pack, "splitter_status": status}

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import array
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -71,30 +73,86 @@ def iter_documents_from_hf(name, split="train", text_field="text", config_name=N
                 return
 
 
-def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repeat=1, respect_sentences=False, max_windows=0):
+def _push_window(rows, ids, L, pad, cap):
+    """Append one length-L window as a compact uint32 row. Returns False at cap."""
+    if cap and len(rows) >= cap:
+        return False
+    seq = [int(x) for x in ids]
+    if len(seq) < L:
+        seq.extend([pad] * (L - len(seq)))
+    elif len(seq) > L:
+        seq = seq[:L]
+    rows.append(array.array("I", seq))
+    return True
+
+
+def _rows_to_tensor(rows, L):
+    """Materialize packed rows as an int64 tensor without a giant list of Python ints."""
+    if not rows:
+        return torch.empty(0, L, dtype=torch.long)
+    buf = array.array("I")
+    for row in rows:
+        buf.extend(row)
+    raw = torch.frombuffer(bytearray(buf), dtype=torch.int32).clone()
+    return raw.to(dtype=torch.long).view(-1, L)
+
+
+def pack_documents(
+    documents,
+    pre_tokenizer,
+    context_length,
+    min_windows=0,
+    repeat=1,
+    respect_sentences=False,
+    max_windows=0,
+    progress_s=30.0,
+):
     """Encode documents, append EOS, and pack/pad to length L.
 
     When respect_sentences is True, a new window starts at a sentence boundary
     whenever the next sentence would overflow the current window. A sentence
     longer than L is packed by tokens as usual.
+
+    Windows are stored as uint32 rows while streaming so a few hundred thousand
+    windows stay near 1 GiB instead of a multi-gigabyte list of Python ints.
+    The returned tensor is still int64, matching the previous packing result.
     """
     eos = int(pre_tokenizer.eos_token_id)
     pad = int(pre_tokenizer.pad_token_id)
     L = int(context_length)
     n_docs = 0
     n_toks = 0
-    windows = []
+    rows = []
     cap = int(max_windows or 0)
 
     def enough():
-        return cap > 0 and len(windows) >= cap
+        return cap > 0 and len(rows) >= cap
 
-    def flush(cur):
-        if not cur:
-            return []
-        if len(cur) < L:
-            return cur + [pad] * (L - len(cur))
-        return cur[:L]
+    def push(ids):
+        return _push_window(rows, ids, L, pad, cap)
+
+    import time
+    started = time.monotonic()
+    last_log = started
+    announced = False
+
+    def note_progress(force=False):
+        """Time-based progress. A 5000-doc stride stayed silent for the whole v6 hang."""
+        nonlocal last_log, announced
+        interval = float(progress_s if progress_s is not None else 30.0)
+        # Quiet for tiny unit-test caps unless the caller asked for frequent logs.
+        if cap < 65536 and interval >= 30.0:
+            return
+        now = time.monotonic()
+        if announced and not force and (now - last_log) < interval:
+            return
+        announced = True
+        last_log = now
+        print(
+            f"packing... docs={n_docs} windows={len(rows)} tokens={n_toks} "
+            f"elapsed={now - started:.0f}s cap={cap or 'none'}",
+            flush=True,
+        )
 
     if respect_sentences:
         from utils.linguistic import split_sentences
@@ -112,19 +170,19 @@ def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repe
                     n_toks += len(ids)
                     if len(ids) > L:
                         if cur:
-                            windows.append(flush(cur))
+                            push(cur)
                             cur = []
                         for i in range(0, len(ids), L):
                             if enough():
                                 break
                             chunk = ids[i:i + L]
                             if len(chunk) == L:
-                                windows.append(chunk)
+                                push(chunk)
                             else:
                                 cur = list(chunk)
                         continue
                     if cur and len(cur) + len(ids) > L:
-                        windows.append(flush(cur))
+                        push(cur)
                         cur = []
                     cur.extend(ids)
                     if enough():
@@ -132,35 +190,37 @@ def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repe
                 if wrote:
                     n_docs += 1
                     if len(cur) >= L:
-                        windows.append(cur[:L])
+                        push(cur[:L])
                         cur = cur[L:]
                     if not enough():
                         if len(cur) + 1 <= L:
                             cur.append(eos)
                             n_toks += 1
                         else:
-                            windows.append(flush(cur))
+                            push(cur)
                             cur = [eos]
                             n_toks += 1
+                    note_progress()
                 if enough():
                     stop = True
                     break
             if stop or enough():
                 break
         if cur and not enough():
-            windows.append(flush(cur))
-        if not windows:
+            push(cur)
+        if not rows:
             raise ValueError("no tokens produced from the given documents")
     else:
-        stream = []
+        stream = array.array("I")
         for _ in range(max(int(repeat), 1)):
             for text in documents:
                 ids = pre_tokenizer.encode(text)
                 if not ids:
                     continue
-                stream.extend(ids)
+                stream.extend(int(x) for x in ids)
                 stream.append(eos)
                 n_docs += 1
+                note_progress()
                 if cap and len(stream) >= cap * L:
                     break
             if cap and len(stream) >= cap * L:
@@ -174,17 +234,232 @@ def pack_documents(documents, pre_tokenizer, context_length, min_windows=0, repe
             chunk = stream[i:i + L]
             if not chunk:
                 continue
-            if len(chunk) < L:
-                chunk = chunk + [pad] * (L - len(chunk))
-            windows.append(chunk)
+            push(chunk)
 
-    if cap and len(windows) > cap:
-        windows = windows[:cap]
-    if min_windows and len(windows) < min_windows:
-        reps = (min_windows + len(windows) - 1) // len(windows)
-        windows = windows * reps
-    data = torch.tensor(windows, dtype=torch.long)
+    if cap and len(rows) > cap:
+        del rows[cap:]
+    if min_windows and len(rows) < min_windows:
+        reps = (min_windows + len(rows) - 1) // len(rows)
+        rows = rows * reps
+    note_progress(force=True)
+    data = _rows_to_tensor(rows, L)
     return data, n_docs, n_toks
+
+
+def split_heldout_windows(windows: torch.Tensor, n_val: int, min_train: int = 1):
+    """Hold out a deterministic tail. The train prefix is not reshuffled.
+
+    Returns the original tensor when the pool is too small to spare `n_val`
+    windows and still leave `min_train` for the DistributedSampler.
+    """
+    n_val = int(n_val or 0)
+    min_train = max(int(min_train or 0), 0)
+    n = int(windows.shape[0]) if windows is not None and windows.ndim == 2 else 0
+    if n_val <= 0 or n <= n_val + min_train:
+        empty = windows.new_empty((0, windows.shape[1])) if windows is not None and windows.ndim == 2 else windows
+        return windows, empty
+    return windows[:-n_val], windows[-n_val:]
+
+
+def corpus_cache_meta(args, L, max_windows, respect_sentences, pack_repeat, eos, pad):
+    """Identity of a packed pool. A mismatch rebuilds artifacts/packed_windows.pt."""
+    max_docs = getattr(args, "max_docs", None)
+    return {
+        "L": int(L),
+        "max_windows": int(max_windows or 0),
+        "respect_sentences": bool(respect_sentences),
+        "pack_repeat": int(pack_repeat),
+        "eos": int(eos),
+        "pad": int(pad),
+        "hf_dataset": str(getattr(args, "hf_dataset", None) or ""),
+        "hf_split": str(getattr(args, "hf_split", None) or ""),
+        "hf_text_field": str(getattr(args, "hf_text_field", None) or ""),
+        "data": str(getattr(args, "data", None) or ""),
+        "max_docs": int(max_docs) if max_docs else 0,
+    }
+
+
+def _cache_matches(saved, expect) -> bool:
+    if not isinstance(saved, dict) or not isinstance(expect, dict):
+        return False
+    return all(saved.get(k) == expect.get(k) for k in expect)
+
+
+def _atomic_torch_save(path: Path, payload):
+    """Write via a temp file and os.replace so readers never see a partial cache."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+
+def _atomic_write_text(path: Path, text: str):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# Longer than NCCL's default 10-minute watchdog. Sentence-packing 524288
+# BookCorpus windows on one CPU exceeded that in Kaggle session v6.
+PACK_WAIT_TIMEOUT_S = 6 * 3600.0
+
+
+def _load_packed_cache(path: Path, expect):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        print(f"ignoring packed-window cache {path} ({exc!r})", flush=True)
+        return None
+    if not _cache_matches(payload.get("meta"), expect):
+        return None
+    windows = payload.get("windows")
+    if not torch.is_tensor(windows) or windows.ndim != 2:
+        return None
+    return windows.to(dtype=torch.long), int(payload.get("n_docs", 0)), int(payload.get("n_toks", 0))
+
+
+def _wait_for_packed_cache(cache_path, expect, error_path, timeout_s, poll_s):
+    """Poll the cache file. This must not enter an NCCL collective.
+
+    Kaggle v6 died here: rank 1 blocked in an NCCL barrier while rank 0 was
+    still sentence-packing, and the watchdog aborted at 600s. Rank 0 had
+    not entered that collective. A filesystem poll has no watchdog.
+    """
+    import time
+    cache_path = Path(cache_path)
+    timeout_s = float(timeout_s)
+    poll_s = max(float(poll_s), 0.01)
+    started = time.monotonic()
+    start_wall = time.time()
+    next_log = started
+    while True:
+        if error_path is not None and error_path.is_file():
+            try:
+                fresh = error_path.stat().st_mtime >= start_wall - 1.0
+            except OSError:
+                fresh = False
+            if fresh:
+                raise RuntimeError(error_path.read_text(encoding="utf-8") or f"pack failed: {error_path}")
+        loaded = _load_packed_cache(cache_path, expect)
+        if loaded is not None:
+            windows, n_docs, n_toks = loaded
+            print(
+                f"loaded packed windows from {cache_path} "
+                f"({len(windows)} windows, cap={expect.get('max_windows')})",
+                flush=True,
+            )
+            return windows, n_docs, n_toks
+        now = time.monotonic()
+        if now - started >= timeout_s:
+            raise TimeoutError(
+                f"timed out after {timeout_s:.0f}s waiting for {cache_path} "
+                "(rank 0 is still packing or the cache was not published)"
+            )
+        if now >= next_log:
+            print(
+                f"waiting for packed windows at {cache_path} "
+                f"({now - started:.0f}s, no NCCL barrier)",
+                flush=True,
+            )
+            next_log = now + 30.0
+        time.sleep(poll_s)
+
+
+def acquire_packed_windows(
+    documents,
+    pre_tokenizer,
+    context_length,
+    *,
+    min_windows,
+    repeat,
+    respect_sentences,
+    max_windows,
+    cache_path,
+    cache_meta,
+    rank=0,
+    world_size=1,
+    wait_timeout_s=PACK_WAIT_TIMEOUT_S,
+    wait_poll_s=2.0,
+    progress_s=30.0,
+):
+    """Pack on rank 0, or reuse a matching cache, then load the same tensor everywhere.
+
+    Only rank 0 packs, so two Kaggle processes do not each hold the Python
+    pack buffer. The result is published with os.replace. Other ranks poll
+    that file. They do not enter a collective while the pack runs, because
+    a 524288-window sentence pack is longer than the default 10-minute
+    watchdog (Kaggle session v6).
+
+    A later session reuses artifacts/packed_windows.pt when `cache_meta`
+    matches (cap, sentence packing, tokenizer eos/pad, corpus). A truncated
+    or unreadable file is ignored and rebuilt. The sampler still sees one
+    identical window tensor on every rank.
+    """
+    cache_path = Path(cache_path) if cache_path else None
+    error_path = cache_path.with_name(cache_path.name + ".error") if cache_path is not None else None
+    if cache_path is not None:
+        loaded = _load_packed_cache(cache_path, cache_meta)
+        if loaded is not None:
+            windows, n_docs, n_toks = loaded
+            print(
+                f"loaded packed windows from {cache_path} "
+                f"({len(windows)} windows, cap={cache_meta.get('max_windows')})",
+                flush=True,
+            )
+            return windows, n_docs, n_toks, False
+
+    if int(rank) != 0:
+        if cache_path is None:
+            raise RuntimeError("multi-rank packing requires a cache_path")
+        windows, n_docs, n_toks = _wait_for_packed_cache(
+            cache_path, cache_meta, error_path, wait_timeout_s, wait_poll_s
+        )
+        return windows, n_docs, n_toks, False
+
+    if error_path is not None and error_path.exists():
+        error_path.unlink()
+    try:
+        print(
+            f"packing windows on rank 0 cap={int(max_windows or 0)} "
+            f"L={int(context_length)} respect_sentences={bool(respect_sentences)} "
+            "(other ranks poll the cache file; no NCCL barrier)",
+            flush=True,
+        )
+        windows, n_docs, n_toks = pack_documents(
+            documents,
+            pre_tokenizer,
+            context_length,
+            min_windows=min_windows,
+            repeat=repeat,
+            respect_sentences=respect_sentences,
+            max_windows=max_windows,
+            progress_s=progress_s,
+        )
+        if cache_path is not None:
+            _atomic_torch_save(
+                cache_path,
+                {
+                    "windows": windows.to(dtype=torch.int32),
+                    "n_docs": int(n_docs),
+                    "n_toks": int(n_toks),
+                    "meta": dict(cache_meta),
+                },
+            )
+            # Refuse to publish a file we cannot read back. Peers only accept a match.
+            check = _load_packed_cache(cache_path, cache_meta)
+            if check is None:
+                raise RuntimeError(f"packed-window cache failed verification: {cache_path}")
+        return windows, n_docs, n_toks, True
+    except Exception as exc:
+        if error_path is not None:
+            _atomic_write_text(error_path, repr(exc))
+        raise
 
 
 def default_workers(user_value=None, pin_memory=False):

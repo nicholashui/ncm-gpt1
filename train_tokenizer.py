@@ -21,8 +21,8 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from utils.linguistic import pack_kwargs_from_cfg
-from utils.data import infinite_loader, iter_all_documents, make_loader, pack_documents
+from utils.linguistic import activate_splitter
+from utils.data import acquire_packed_windows, corpus_cache_meta, infinite_loader, iter_all_documents, make_loader
 from utils.train_utils import (
     TimeBudget,
     ThroughputMeter,
@@ -51,6 +51,7 @@ from utils.train_utils import (
     resolve_compile,
     resolve_resume,
     save_checkpoint,
+    unwrap_model,
     set_lr,
     set_seed,
     setup_amp,
@@ -125,24 +126,37 @@ def main():
     if world_size > 1:
         dist_print(f"ddp world_size={world_size}  batch_size={batch_size} per GPU")
 
-    pack_kw = pack_kwargs_from_cfg(cfg)
+    splitter_kw = activate_splitter(cfg, args.output_dir, pre_tok)
     max_windows = args.max_windows if args.max_windows is not None else _cfg_data(cfg, "max_windows")
-    if max_windows:
-        pack_kw["max_windows"] = int(max_windows)
+    max_windows = int(max_windows or 0)
     L = int(cfg.tokenizer.vqvae.context_length)
-    if world_size > 1:
-        import torch.distributed as dist
-        dist.barrier()
-    docs = iter_all_documents(args)
+    cache_meta = corpus_cache_meta(
+        args, L, max_windows, splitter_kw["respect_sentences"], pack_repeat, int(pre_tok.eos_token_id), pad_id
+    )
+    cache_path = Path(args.output_dir).resolve().parent / "packed_windows.pt"
+    # No NCCL barrier here. A long pack must not post a collective that the
+    # peer rank can time out on. Other ranks poll packed_windows.pt.
+    docs = iter_all_documents(args) if rank == 0 else ()
     try:
-        windows, n_docs, n_toks = pack_documents(
-            docs, pre_tok, L, min_windows=batch_size * world_size, repeat=pack_repeat, **pack_kw
+        windows, n_docs, n_toks, packed_now = acquire_packed_windows(
+            docs,
+            pre_tok,
+            L,
+            min_windows=batch_size * world_size,
+            repeat=pack_repeat,
+            respect_sentences=splitter_kw["respect_sentences"],
+            max_windows=max_windows,
+            cache_path=cache_path,
+            cache_meta=cache_meta,
+            rank=rank,
+            world_size=world_size,
         )
     except ValueError as exc:
         raise SystemExit(f"provide --data and/or --hf_dataset ({exc})") from exc
-    if pack_kw.get("respect_sentences"):
-        dist_print("packing windows at sentence boundaries")
-    dist_print(f"packed {n_docs} docs / {n_toks} tokens -> {len(windows)} windows of L={L}")
+    dist_print(
+        f"packed {n_docs} docs / {n_toks} tokens -> {len(windows)} windows of L={L} "
+        f"(cap={max_windows} cache={'wrote' if packed_now else 'hit'} {cache_path})"
+    )
     loader, sampler = make_loader(
         windows,
         batch_size=batch_size,
@@ -236,7 +250,7 @@ def main():
                     ignore_index=pad_id,
                 )
                 loss = ce + vq_loss
-            optimize(loss, opt, vqvae.parameters(), clip, scaler)
+            grad_norm = optimize(loss, opt, vqvae.parameters(), clip, scaler)
             meter.update(tokens.numel())
 
             acc = tokenizer_recon_accuracy(logits.detach(), tokens, pad_id)
@@ -250,10 +264,18 @@ def main():
                     vals = utils_per.detach().float().flatten().tolist()
                     if vals:
                         util_parts = {"util_first": vals[0], "util_mid": vals[len(vals) // 2], "util_last": vals[-1]}
+                vq_mod = unwrap_model(vqvae).vq
+                fine_drop_prob = float(getattr(vq_mod, "last_fine_drop_prob", 0.0))
+                fine_drop_keep = int(getattr(vq_mod, "last_fine_drop_keep", 0))
+                fine_drop_applied = bool(getattr(vq_mod, "last_fine_drop_applied", False))
+                n_train = max(int(windows.shape[0]), 1)
+                data_epoch = (step + 1) * batch_size * world_size / n_train
                 last_log = (
                     f"step {step + 1}/{max_steps}  loss={loss.item():.4f}  ce={ce.item():.4f}  "
                     f"vq={float(vq_loss.detach()):.4f}  acc={acc:.4f}  util={util:.4f}  "
-                    f"lr={lr:.2e}  {steps_s:.2f} steps/s  {toks_s:.0f} tok/s  mem={mem:.2f}GiB"
+                    f"lr={lr:.2e}  {steps_s:.2f} steps/s  {toks_s:.0f} tok/s  mem={mem:.2f}GiB  "
+                    f"grad={grad_norm:.3f}  epoch={data_epoch:.3f}  "
+                    f"fine_drop_p={fine_drop_prob:.2f} keep={fine_drop_keep} applied={int(fine_drop_applied)}"
                 )
                 pbar.set_postfix(
                     loss=f"{loss.item():.3f}",
@@ -276,6 +298,12 @@ def main():
                     "tokens_per_s": toks_s,
                     "mem_gb": mem,
                     "hours": budget.elapsed_hours(),
+                    "grad_norm": grad_norm,
+                    "data_epoch": data_epoch,
+                    "n_windows": int(windows.shape[0]),
+                    "fine_drop_prob": fine_drop_prob,
+                    "fine_drop_keep": fine_drop_keep,
+                    "fine_drop_applied": fine_drop_applied,
                 }
                 if util_parts:
                     rec.update(util_parts)

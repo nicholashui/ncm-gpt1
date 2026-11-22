@@ -116,6 +116,24 @@ def main():
         if args.adaptive is not None:
             ad["enabled"] = bool(args.adaptive)
         sc = default_splitter_cfg(cfg.get("splitter", {}))
+        if sc["enabled"] and sc["backend"] == "rules":
+            print(
+                "splitter backend=rules has no learned weights; "
+                f"guide_expand={bool(sc['guide_expand'])} uses the rule-based sentence/phrase/word split"
+            )
+        elif sc["enabled"] and sc["backend"] == "model":
+            from models.splitter import maybe_load_splitter_model
+            tagger = maybe_load_splitter_model(cfg, pre_tok, map_location=device)
+            if tagger is None:
+                print(
+                    "splitter backend=model did not load; "
+                    f"guide_expand={bool(sc['guide_expand'])} still uses the rule-based split"
+                )
+            else:
+                print(
+                    f"splitter backend=model loaded; guide_expand={bool(sc['guide_expand'])} "
+                    "still maps cells with the rule-based split"
+                )
         if sc["enabled"] and sc["guide_expand"]:
             ad["guide_expand"] = True
             ad["unit"] = sc["unit"]

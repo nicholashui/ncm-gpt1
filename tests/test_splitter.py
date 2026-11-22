@@ -69,6 +69,41 @@ def test_pack_by_sentence():
         assert "BBB" not in w or w.strip().find("BBB") == 0 or ". BBB" in w or "BBBB." in w
 
 
+def test_rules_splitter_records_status(tmp):
+    import json
+    from omegaconf import OmegaConf
+    from utils.linguistic import activate_splitter
+
+    stage = tmp / "generator"
+    stage.mkdir()
+    cfg = OmegaConf.create({
+        "splitter": {
+            "enabled": True,
+            "backend": "rules",
+            "ckpt": "artifacts/splitter/splitter.pt",
+            "pack_by_sentence": True,
+            "guide_expand": True,
+            "unit": "auto",
+        }
+    })
+    out = activate_splitter(cfg, stage)
+    assert out["respect_sentences"] is True
+    status_path = tmp / "splitter" / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["backend"] == "rules"
+    assert status["weights"] is False
+    assert status["pack_by_sentence"] is True
+    assert status["guide_expand"] is True
+    assert not (tmp / "splitter" / "splitter.pt").exists()
+
+    cfg.splitter.backend = "model"
+    cfg.splitter.ckpt = str(tmp / "missing.pt")
+    out = activate_splitter(cfg, stage)
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["fallback"] == "rules"
+    assert out["respect_sentences"] is True
+
+
 def test_pick_unit():
     assert pick_unit(4, 512, "auto") == "sentence"
     assert pick_unit(100, 512, "auto") == "phrase"
@@ -77,9 +112,12 @@ def test_pick_unit():
 
 
 if __name__ == "__main__":
+    import tempfile
     test_sentences()
     test_phrases_and_words()
     test_tree_and_char_tokenizer()
     test_pack_by_sentence()
+    with tempfile.TemporaryDirectory() as raw:
+        test_rules_splitter_records_status(Path(raw))
     test_pick_unit()
     print("ok")

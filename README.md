@@ -117,14 +117,18 @@ Kaggle 每週約 30 個 GPU 小時，單場最長 12 小時，T4 × 2 共 32 GiB
 2. notebook 會 clone 本倉庫、安裝 `omegaconf hydra-core datasets regex`（**不要重裝 torch**），然後執行：
 
 ```bash
-python scripts/train_kaggle.py --hours 11.5 --output_dir /kaggle/working/artifacts
+python scripts/train_kaggle.py --hours 11.5 --reserve_minutes 15 \
+    --output_dir /kaggle/working/artifacts --config config/kaggle.yaml \
+    --batch_size 2 --gradient_checkpointing
 ```
 
-3. 編排腳本先訓練 tokenizer，完成後再用剩餘時間訓練 generator。時間到會存 `latest.pt` 並退出。把該場 Output 加成下一場的 Input dataset，再跑一次同一份 notebook 就會自動續訓。
-4. 預設語料是 BookCorpus 開源重建版；若下載失敗，會改用 MiniPile，再不行才用 TinyStories。設定在 `config/kaggle.yaml`（Flex 關閉、每卡 batch 8、每 1000 步存檔）。
-5. 日誌在 `artifacts/tokenizer/tokenizer_log.jsonl` 與 `artifacts/generator/generator_log.jsonl`。`status.json` 的 `finished: true` 代表該階段已跑完設定的 `max_steps`（預設各 10 萬步）。
+3. 編排腳本先看 tokenizer 的 `status.json`。`finished: true` 就跳過，再用剩餘時間訓練 generator。時間到會存 `latest.pt` 並退出。v8 正在跑，不要中斷。v8 結束後再掛上 **COMPLETE 的 kernel 第 8 版 Output**（tokenizer 已完成；generator 從 v8 的 `latest.pt` 續，v8 是從 step 40457 接著跑的）。
+4. 預設語料是 BookCorpus 開源重建版；若下載失敗，會改用 MiniPile，再不行才用 TinyStories。`config/kaggle.yaml`：Flex 關閉、chunked attention、梯度檢查點、T4 用 fp16、generator 每卡 **batch 2**、`max_windows: 524288`（約 2.68 億 token，並快取 `artifacts/packed_windows.pt`；其他 rank 輪詢這個檔，不在 NCCL barrier 上等打包）、`alpha: 0.5`、`mid_aux: 0.5`。v7 把 batch 從 2 加到 4 之後，tokens/s 仍約 1400，steps/s 從約 0.69 降到約 0.34，所以步數預算用 batch 2 更快。`alpha` 與 `mid_aux` **都不是**論文 ELBO（本機 `gpt1.yaml` 仍是 `alpha: 0`、沒有 `mid_aux`）。v7 在 `alpha: 0.5` 下，最短預測層 CE 約 4.5、最細 512 層約 1.5，中間長度 81–225 仍約 5.2–6.1；`mid_aux` 把該段的平均 CE 再加進總損失。總損失不要和 v5（alpha 0）或 v7/v8（alpha 0.5、mid_aux 0）比較；各層 CE 仍可比較。每 1000 步在 rank 0 對 256 個保留視窗算 val loss 與各層 CE。
+5. 日誌在 `artifacts/tokenizer/tokenizer_log.jsonl` 與 `artifacts/generator/generator_log.jsonl`。舊欄位（`loss`、`ce_first` / `ce_mid` / `ce_last`、`ce`、`acc`）都還在，另外多了 `ce_levels`、`grad_norm`、`data_epoch`、`corrupt_p`、`mid_aux`，tokenizer 另有 `fine_drop_keep`。`status.json` 的 `finished: true` 代表該階段已跑完設定的 `max_steps`。規則切分器沒有權重，會寫 `artifacts/splitter/status.json`，並照樣按句打包。
 
-雙 T4 + 分層注意力，完整 10 萬 + 10 萬步有機會在約 30 小時內分幾場跑完，但仍取決於實際 steps/s。若顯存不足，把 `--batch_size` 改成 4。
+v8 的權重與 optimizer 會從該檢查點載入。下一場的總損失多了 `mid_aux`，不要和 v8 的 loss 曲線直接比較。
+
+梯度檢查點維持開啟。v7 在 batch 4 時峰值約 4.1 GiB，沒有 OOM；改回 batch 2 是為了每小時更多步，不是因為顯存不夠。
 
 多卡本機等價指令：
 
